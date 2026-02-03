@@ -1,0 +1,387 @@
+import os
+import re
+import socket
+import platform
+import uuid
+import psutil
+import requests
+import time
+import json
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ----------------------------
+# Config
+# ----------------------------
+POST_URL = "http://localhost:4444/data"  # seu endpoint
+PING_TIMEOUT_MS = 350
+MAX_WORKERS = 120
+
+# Portas para "chutar" o SO/dispositivo (heurística)
+PORT_PROBES = {
+    445: ("smb", "windows (SMB)"),
+    139: ("netbios", "windows (netbios)"),
+    3389: ("rdp", "windows (rdp)"),
+    22:  ("ssh", "linux/ssh"),
+    548: ("afp", "macos (afp)"),
+    80:  ("http", "web device"),
+    443: ("https", "web device"),
+}
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def get_port():
+    if os.path.exists("port.txt"):
+        with open("port.txt", "r", encoding="utf-8") as f:
+            return f.read().strip()
+    port = input("Digite a sua porta: ").strip()
+    with open("port.txt", "w", encoding="utf-8") as f:
+        f.write(port)
+    return port
+
+
+def is_apipa(ip: str) -> bool:
+    return ip.startswith("169.254.")
+
+
+def is_private_candidate(ip: str) -> int:
+    """Score para escolher o IP LAN correto."""
+    if ip.startswith("192.168."):
+        return 300
+    if ip.startswith("10."):
+        return 200
+    if ip.startswith("172."):
+        try:
+            a = int(ip.split(".")[1])
+            if 16 <= a <= 31:
+                return 150
+        except Exception:
+            pass
+        return 50
+    return 0
+
+
+def get_default_gateway_ipv4():
+    """
+    Puxa o gateway padrão via `ipconfig` (Windows), sem precisar de PowerShell.
+    Retorna string do gateway (ex: 192.168.1.1) ou None.
+    """
+    try:
+        out = subprocess.check_output(["ipconfig"], text=True, encoding="cp850", errors="ignore")
+        m = re.findall(r"(?:Gateway padrão|Default Gateway)[^\d]*(\d+\.\d+\.\d+\.\d+)", out)
+        if m:
+            for gw in m:
+                if not is_apipa(gw):
+                    return gw
+    except Exception:
+        pass
+    return None
+
+
+def get_local_ipv4_and_prefix():
+    """
+    Seleciona o IPv4 correto:
+    - ignora loopback 127.*
+    - ignora APIPA 169.254.*
+    - prioriza IPs privados comuns
+    - tenta casar com o gateway padrão
+    """
+    gw = get_default_gateway_ipv4()
+
+    candidates = []
+    for iface, addrs in psutil.net_if_addrs().items():
+        for a in addrs:
+            if a.family == socket.AF_INET:
+                ip = a.address
+                mask = a.netmask
+                if not ip or ip.startswith("127.") or is_apipa(ip):
+                    continue
+                if not mask:
+                    continue
+                prefix = sum(bin(int(o)).count("1") for o in mask.split("."))
+                candidates.append((iface, ip, prefix))
+
+    if not candidates:
+        raise RuntimeError("Não encontrei IPv4 válido (fora APIPA/loopback). Verifique conexão Wi-Fi/cabo.")
+
+    if gw:
+        gw_base = ".".join(gw.split(".")[:3]) + "."
+        same_net = [c for c in candidates if c[1].startswith(gw_base)]
+        if same_net:
+            same_net.sort(key=lambda x: is_private_candidate(x[1]), reverse=True)
+            return same_net[0][1], same_net[0][2]
+
+    candidates.sort(key=lambda x: is_private_candidate(x[1]), reverse=True)
+    return candidates[0][1], candidates[0][2]
+
+
+def ip_range_from_local(ip: str):
+    """Varre /24: 192.168.1.1..254"""
+    base = ".".join(ip.split(".")[:3])
+    return [f"{base}.{i}" for i in range(1, 255)]
+
+
+def flush_arp():
+    """Limpa cache ARP (pode falhar sem admin, ok)."""
+    try:
+        subprocess.run(["arp", "-d", "*"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def ping_quiet(ip):
+    """Ping rápido só pra popular ARP."""
+    try:
+        r = subprocess.run(
+            ["ping", "-n", "1", "-w", str(PING_TIMEOUT_MS), ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def get_ttl_windows(ip):
+    """Extrai TTL do ping no Windows (se responder ICMP)."""
+    try:
+        out = subprocess.check_output(
+            ["ping", "-n", "1", "-w", str(PING_TIMEOUT_MS), ip],
+            text=True, encoding="cp850", errors="ignore"
+        )
+        m = re.search(r"TTL=(\d+)", out, re.IGNORECASE)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def refresh_arp_table(ips):
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(ping_quiet, ip) for ip in ips]
+        for _ in as_completed(futures):
+            pass
+
+
+def parse_arp_table():
+    """Lê `arp -a` e retorna dict ip->mac"""
+    out = subprocess.check_output(["arp", "-a"], text=True, encoding="cp850", errors="ignore")
+    ip_mac = {}
+    for line in out.splitlines():
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F\-]{17})", line)
+        if m:
+            ip = m.group(1)
+            mac = m.group(2).lower()
+            ip_mac[ip] = mac
+    return ip_mac
+
+
+def try_reverse_dns(ip):
+    try:
+        name, _, _ = socket.gethostbyaddr(ip)
+        return name
+    except Exception:
+        return None
+
+
+def is_port_open(ip, port, timeout=0.25):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def get_http_server_header(ip, port=80, timeout=0.4):
+    """Tenta pegar header Server via HTTP HEAD (quando porta 80 está aberta)."""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as s:
+            req = f"HEAD / HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n"
+            s.sendall(req.encode("ascii", errors="ignore"))
+            data = s.recv(2048).decode("latin-1", errors="ignore")
+        m = re.search(r"^Server:\s*(.+)$", data, re.IGNORECASE | re.MULTILINE)
+        return m.group(1).strip() if m else None
+    except Exception:
+        return None
+
+
+def guess_os_by_ttl(ttl):
+    if ttl is None:
+        return None
+    # Heurística comum:
+    if 110 <= ttl <= 128:
+        return "windows (ttl)"
+    if 50 <= ttl <= 64:
+        return "linux/macos (ttl)"
+    if ttl >= 200:
+        return "roteador/iot (ttl alto)"
+    return "desconhecido (ttl)"
+
+
+def guess_by_hostname(hostname):
+    if not hostname:
+        return None
+    hn = hostname.lower()
+
+    if hn.startswith("desktop-") or hn.startswith("win-") or hn.endswith(".localdomain"):
+        return "windows (hostname)"
+    if "iphone" in hn or "ipad" in hn:
+        return "ios (hostname)"
+    if "android" in hn:
+        return "android (hostname)"
+    if "raspberry" in hn:
+        return "linux (hostname)"
+    if "macbook" in hn or "imac" in hn:
+        return "macos (hostname)"
+
+    return None
+
+
+def probe_ports(ip):
+    """
+    Retorna:
+      - lista de tags abertas (ex: ['smb','rdp'])
+      - lista de labels
+    """
+    open_tags = []
+    labels = []
+    for port, (tag, label) in PORT_PROBES.items():
+        if is_port_open(ip, port):
+            open_tags.append(tag)
+            labels.append(label)
+    return open_tags, labels
+
+
+def guess_os_smart(ip, hostname=None):
+    """
+    Combina hostname + ttl + portas + header http para um chute mais útil.
+    """
+    # 1) hostname
+    hn_guess = guess_by_hostname(hostname)
+
+    # 2) portas
+    open_tags, labels = probe_ports(ip)
+
+    port_guess = None
+    if "smb" in open_tags or "rdp" in open_tags or "netbios" in open_tags:
+        port_guess = "windows (portas)"
+    elif "ssh" in open_tags:
+        port_guess = "linux (portas)"
+    elif "http" in open_tags or "https" in open_tags:
+        port_guess = "dispositivo web (portas)"
+
+    # 3) ttl
+    ttl = get_ttl_windows(ip)
+    ttl_guess = guess_os_by_ttl(ttl) if ttl is not None else None
+
+    # 4) server header
+    server = None
+    if "http" in open_tags:
+        server = get_http_server_header(ip, 80)
+
+    # decisão (prioridade)
+    final = hn_guess or port_guess or ttl_guess or "desconhecido"
+
+    extras = []
+    if ttl is not None:
+        extras.append(f"ttl={ttl}")
+    if open_tags:
+        extras.append("ports=" + ",".join(open_tags))
+    if server:
+        extras.append(f"server={server}")
+
+    if extras:
+        final += " | " + " | ".join(extras)
+
+    return final
+
+
+def build_device_record(ip, mac):
+    hostname = try_reverse_dns(ip)
+    os_guess = guess_os_smart(ip, hostname)
+    return {
+        "dispositivo": hostname or "desconhecido",
+        "sistema_operacional": os_guess,
+        "endereco_ip": ip,
+        "endereco_mac": mac,
+        "status": "Online",
+    }
+
+def get_local_mac_fallback():
+    try:
+        mac_int = uuid.getnode()
+        mac = ":".join([f"{(mac_int >> i) & 0xff:02x}" for i in range(0, 8 * 6, 8)][::-1])
+        return mac.lower()
+    except Exception:
+        return ""
+
+
+def build_local_device_record(local_ip: str):
+    hostname = socket.gethostname()
+    mac = get_local_mac_fallback()
+    return {
+        "dispositivo": hostname or "desconhecido",
+        "sistema_operacional": platform.system() or "Windows",
+        "endereco_ip": local_ip,
+        "endereco_mac": mac,
+        "status": "Online",
+        "is_agent_host": True,
+    }
+
+
+def send_data(port, payload):
+    url = f"{POST_URL}?port={port}"
+    headers = {"Content-Type": "application/json"}
+
+    data_with_port = {
+        "port": port,
+        "devices": payload,
+        "collected_at": int(time.time()),
+    }
+
+    try:
+        r = requests.post(url, data=json.dumps(data_with_port), headers=headers, timeout=5)
+        if r.status_code == 200:
+            print(f"OK: enviados {len(payload)} dispositivos")
+        else:
+            print(f"Falha HTTP {r.status_code}: {r.text[:200]}")
+    except requests.exceptions.RequestException as e:
+        print(f"Erro enviando dados: {e}")
+
+
+# ----------------------------
+# Main
+# ----------------------------
+if __name__ == "__main__":
+    port = get_port()
+    print(f"Using port: {port}")
+
+    local_ip, prefix = get_local_ipv4_and_prefix()
+    print(f"Local IP selecionado: {local_ip}/{prefix}")
+
+    ips = ip_range_from_local(local_ip)
+    base = ".".join(local_ip.split(".")[:3]) + "."
+    print(f"Scanning {len(ips)} IPs (rede {base}0/24)...")
+
+    while True:
+        flush_arp()
+        refresh_arp_table(ips)
+
+        ip_mac = parse_arp_table()
+
+        candidates = [(ip, mac) for ip, mac in ip_mac.items() if ip.startswith(base)]
+
+        devices = []
+        # inclui também o próprio host (máquina que está rodando o agente)
+        devices.append(build_local_device_record(local_ip))
+        for ip, mac in candidates:
+            if ip == local_ip:
+                continue
+            devices.append(build_device_record(ip, mac))
+
+        print("Encontrados:", len(devices))
+        for d in devices:
+            print(d)
+
+        send_data(port, devices)
+        time.sleep(10)
