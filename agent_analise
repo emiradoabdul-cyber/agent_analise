@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ----------------------------
 # Config
 # ----------------------------
-POST_URL = "http://localhost:4444/data"  # seu endpoint
+POST_URL = "http://104.234.30.69:4444/data"  # seu endpoint
 PING_TIMEOUT_MS = 350
 MAX_WORKERS = 120
 
