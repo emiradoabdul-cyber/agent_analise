@@ -20,7 +20,7 @@ except Exception:
 # Config
 # ----------------------------
 # Ajuste para o IP/host do seu servidor caso o agente rode em outra mÃ¡quina.
-POST_URL = os.environ.get("IRAMGW_AGENT_CHECK_URL", "http://localhost:4444/pc-check")
+POST_URL = os.environ.get("IRAMGW_AGENT_CHECK_URL", "http://104.234.30.69:4444/pc-check")
 SEND_INTERVAL_SEC = 60
 
 
