@@ -7,6 +7,7 @@ import platform
 import subprocess
 import sys
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 
 def _script_dir() -> str:
     # 1) PyInstaller (rodando como .exe)
@@ -36,11 +37,22 @@ except Exception:
 # ----------------------------
 # Config
 # ----------------------------
+# Server principal (produção)
 POST_URL = os.environ.get("IRAMGW_AGENT_CHECK_URL", "http://104.234.30.69:4444/pc-check")
+
+# Localhost (testes) - se estiver online, usa ele primeiro
+LOCAL_POST_URL = os.environ.get("IRAMGW_AGENT_LOCAL_URL", "http://127.0.0.1:4444/pc-check")
+
 SEND_INTERVAL_SEC = int(os.environ.get("AGENT_SEND_INTERVAL_SEC", "60"))
 
 # Quantos processos mandar no máximo (default alto). Ajuste se necessário.
 MAX_PROCS = int(os.environ.get("AGENT_MAX_PROCS", "500"))
+
+# Timeout curto para checar localhost (não pode travar o agente)
+LOCAL_CHECK_TIMEOUT_SEC = float(os.environ.get("AGENT_LOCAL_CHECK_TIMEOUT_SEC", "0.6"))
+
+# Timeout do POST
+POST_TIMEOUT_SEC = float(os.environ.get("AGENT_POST_TIMEOUT_SEC", "10"))
 
 
 def get_port() -> str:
@@ -164,7 +176,6 @@ def list_processes() -> List[Dict[str, Any]]:
     # ----------------------------
     if psutil is not None:
         try:
-            # attrs que queremos coletar
             attrs = ["pid", "ppid", "name", "exe", "cmdline", "username", "create_time", "memory_info"]
             for p in psutil.process_iter(attrs=attrs):
                 info = p.info or {}
@@ -197,29 +208,23 @@ def list_processes() -> List[Dict[str, Any]]:
                     "create_time": info.get("create_time") if info.get("create_time") else None,
                 })
 
-            # Ordena por memória (só pra priorizar no payload, mas envia bem mais)
+            # Ordena por memória só pra priorizar; você já vai detectar no front
             procs.sort(key=lambda x: (x.get("mem_mb") or 0), reverse=True)
 
-            # Limite alto pra evitar payload absurdo
             if MAX_PROCS > 0 and len(procs) > MAX_PROCS:
                 procs = procs[:MAX_PROCS]
 
             return procs
         except Exception:
-            # cai pro fallback
             pass
 
     # ----------------------------
     # Fallback Windows (tasklist)
-    # - Aqui não dá pra pegar exe/cmdline com qualidade sem psutil.
-    # - Ainda assim enviamos pid + name.
     # ----------------------------
     try:
         out = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], text=True, encoding="cp850", errors="ignore")
-        # CSV format: "Image Name","PID","Session Name","Session#","Mem Usage"
         lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
         for ln in lines:
-            # remove aspas e separa por "," (simples)
             parts = [p.strip().strip('"') for p in ln.split('","')]
             if len(parts) < 2:
                 continue
@@ -230,7 +235,6 @@ def list_processes() -> List[Dict[str, Any]]:
             except Exception:
                 pid = None
 
-            # Mem no formato "12.345 K"
             mem_mb = None
             if len(parts) >= 5:
                 mem_str = parts[4].replace(".", "").replace("K", "").replace("k", "").strip()
@@ -262,17 +266,64 @@ def list_processes() -> List[Dict[str, Any]]:
         return []
 
 
+def _is_url_reachable_http(url: str, timeout_sec: float) -> bool:
+    """
+    Verifica rápido se a URL está respondendo.
+    Usa HEAD com fallback para GET (alguns servidores bloqueiam HEAD).
+    """
+    if requests is None:
+        return False
+
+    try:
+        # Se a URL não tiver caminho, evita erro (mas aqui sempre tem /pc-check)
+        r = requests.head(url, timeout=timeout_sec, allow_redirects=True)
+        if 200 <= r.status_code < 500:
+            return True
+    except Exception:
+        pass
+
+    try:
+        r = requests.get(url, timeout=timeout_sec, allow_redirects=True)
+        if 200 <= r.status_code < 500:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def choose_post_url() -> str:
+    """
+    Preferência:
+    1) Se localhost estiver respondendo -> usa LOCAL_POST_URL
+    2) Caso contrário -> usa POST_URL (servidor)
+    """
+    # Só vale tentar localhost se realmente for localhost/127.0.0.1
+    try:
+        host = (urlparse(LOCAL_POST_URL).hostname or "").lower()
+        is_local = host in ("localhost", "127.0.0.1")
+    except Exception:
+        is_local = False
+
+    if is_local and _is_url_reachable_http(LOCAL_POST_URL, LOCAL_CHECK_TIMEOUT_SEC):
+        return LOCAL_POST_URL
+
+    return POST_URL
+
+
 def post_payload(port: str, payload: dict) -> bool:
     if requests is None:
         print("requests não está instalado. Instale com: pip install requests")
         return False
+
+    chosen_url = choose_post_url()
     try:
-        url = f"{POST_URL}?port={port}"
+        url = f"{chosen_url}?port={port}"
         r = requests.post(
             url,
             data=json.dumps(payload),
             headers={"Content-Type": "application/json"},
-            timeout=10
+            timeout=POST_TIMEOUT_SEC
         )
         if r.status_code == 200:
             return True
@@ -301,7 +352,7 @@ if __name__ == "__main__":
             "ip": ip,
             "os": os_name,
             "uptime": uptime,
-            "processes": processes,  # agora com MUITO mais dados
+            "processes": processes,
             "process_count": len(processes),
             "collected_at": int(time.time()),
         }
