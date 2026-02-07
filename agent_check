@@ -5,6 +5,22 @@ import time
 import socket
 import platform
 import subprocess
+import sys
+from typing import List, Dict, Any, Optional
+
+def _script_dir() -> str:
+    # 1) PyInstaller (rodando como .exe)
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+
+    # 2) Rodando via exec() (pode não existir __file__)
+    f = globals().get("__file__")
+    if not f:
+        return os.getcwd()
+
+    # 3) Rodando como .py normal
+    return os.path.dirname(os.path.abspath(f))
+
 
 try:
     import psutil  # type: ignore
@@ -16,19 +32,18 @@ try:
 except Exception:
     requests = None
 
+
 # ----------------------------
 # Config
 # ----------------------------
-# Ajuste para o IP/host do seu servidor caso o agente rode em outra mÃ¡quina.
 POST_URL = os.environ.get("IRAMGW_AGENT_CHECK_URL", "http://104.234.30.69:4444/pc-check")
-SEND_INTERVAL_SEC = 60
+SEND_INTERVAL_SEC = int(os.environ.get("AGENT_SEND_INTERVAL_SEC", "60"))
+
+# Quantos processos mandar no máximo (default alto). Ajuste se necessário.
+MAX_PROCS = int(os.environ.get("AGENT_MAX_PROCS", "500"))
 
 
-def _script_dir():
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def get_port():
+def get_port() -> str:
     cfg_path = os.path.join(_script_dir(), "agent_check_port.txt")
     if os.path.exists(cfg_path):
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -43,10 +58,10 @@ def is_apipa(ip: str) -> bool:
     return ip.startswith("169.254.")
 
 
-def get_default_gateway_ipv4():
+def get_default_gateway_ipv4() -> Optional[str]:
     try:
         out = subprocess.check_output(["ipconfig"], text=True, encoding="cp850", errors="ignore")
-        m = re.findall(r"(?:Gateway padrÃ£o|Default Gateway)[^\\d]*(\\d+\\.\\d+\\.\\d+\\.\\d+)", out)
+        m = re.findall(r"(?:Gateway padrão|Default Gateway)[^\d]*(\d+\.\d+\.\d+\.\d+)", out)
         if m:
             for gw in m:
                 if not is_apipa(gw):
@@ -72,12 +87,12 @@ def is_private_candidate(ip: str) -> int:
     return 0
 
 
-def get_local_ipv4():
+def get_local_ipv4() -> str:
     if psutil is None:
         return ""
 
     gw = get_default_gateway_ipv4()
-    candidates = []
+    candidates: List[str] = []
     for _, addrs in psutil.net_if_addrs().items():
         for a in addrs:
             if a.family == socket.AF_INET:
@@ -108,7 +123,7 @@ def format_uptime(seconds: int) -> str:
     return f"{hours}h {minutes:02d}m"
 
 
-def get_uptime_text():
+def get_uptime_text() -> str:
     if psutil is None:
         return ""
     try:
@@ -119,7 +134,7 @@ def get_uptime_text():
         return ""
 
 
-def get_os_name():
+def get_os_name() -> str:
     try:
         system = platform.system() or "Windows"
         release = platform.release() or ""
@@ -130,53 +145,135 @@ def get_os_name():
         return ""
 
 
-def list_processes():
-    """
-    Retorna lista de processos para exibir no dashboard.
-    Sem dependÃªncias extras: usa psutil se existir; senÃ£o tenta 'tasklist' no Windows.
-    """
-    procs = []
+def _base_name(name: str) -> str:
+    n = (name or "").strip().lower()
+    if n.endswith(".exe"):
+        n = n[:-4]
+    return n
 
+
+def list_processes() -> List[Dict[str, Any]]:
+    """
+    Retorna lista extensa de processos.
+    Prioriza psutil (melhor qualidade). Fallback Windows tenta tasklist.
+    """
+    procs: List[Dict[str, Any]] = []
+
+    # ----------------------------
+    # Caminho ideal (psutil)
+    # ----------------------------
     if psutil is not None:
         try:
-            for p in psutil.process_iter(["name", "memory_info"]):
+            # attrs que queremos coletar
+            attrs = ["pid", "ppid", "name", "exe", "cmdline", "username", "create_time", "memory_info"]
+            for p in psutil.process_iter(attrs=attrs):
                 info = p.info or {}
                 name = (info.get("name") or "").strip()
                 if not name:
                     continue
-                mem = info.get("memory_info")
-                mem_mb = (mem.rss / (1024 * 1024)) if mem and getattr(mem, "rss", None) else None
-                procs.append({"name": name, "cpu": None, "mem_mb": mem_mb})
 
-            procs.sort(key=lambda x: (x["mem_mb"] or 0), reverse=True)
-            # manda mais do que 5 (UI controla rolagem); limita para nÃ£o estourar payload
-            return procs[:30]
+                mem = info.get("memory_info")
+                mem_mb = None
+                try:
+                    if mem and getattr(mem, "rss", None) is not None:
+                        mem_mb = float(mem.rss) / (1024 * 1024)
+                except Exception:
+                    mem_mb = None
+
+                exe = info.get("exe")
+                cmdline = info.get("cmdline")
+                if isinstance(cmdline, tuple):
+                    cmdline = list(cmdline)
+
+                procs.append({
+                    "pid": info.get("pid"),
+                    "ppid": info.get("ppid"),
+                    "name": name,
+                    "base_name": _base_name(name),
+                    "exe": exe if exe else None,
+                    "cmdline": cmdline if cmdline else None,
+                    "username": info.get("username") if info.get("username") else None,
+                    "mem_mb": mem_mb,
+                    "create_time": info.get("create_time") if info.get("create_time") else None,
+                })
+
+            # Ordena por memória (só pra priorizar no payload, mas envia bem mais)
+            procs.sort(key=lambda x: (x.get("mem_mb") or 0), reverse=True)
+
+            # Limite alto pra evitar payload absurdo
+            if MAX_PROCS > 0 and len(procs) > MAX_PROCS:
+                procs = procs[:MAX_PROCS]
+
+            return procs
         except Exception:
+            # cai pro fallback
             pass
 
-    # Fallback Windows
+    # ----------------------------
+    # Fallback Windows (tasklist)
+    # - Aqui não dá pra pegar exe/cmdline com qualidade sem psutil.
+    # - Ainda assim enviamos pid + name.
+    # ----------------------------
     try:
-        out = subprocess.check_output(["tasklist"], text=True, encoding="cp850", errors="ignore")
+        out = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], text=True, encoding="cp850", errors="ignore")
+        # CSV format: "Image Name","PID","Session Name","Session#","Mem Usage"
         lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-        for ln in lines[3:]:  # pula cabeÃ§alho
-            parts = re.split(r"\\s{2,}", ln)
-            if not parts:
+        for ln in lines:
+            # remove aspas e separa por "," (simples)
+            parts = [p.strip().strip('"') for p in ln.split('","')]
+            if len(parts) < 2:
                 continue
             name = parts[0].strip()
-            if name and not name.lower().startswith("nome da imagem"):
-                procs.append({"name": name, "cpu": None, "mem_mb": None})
-        return procs[:30]
+            pid = None
+            try:
+                pid = int(parts[1].strip())
+            except Exception:
+                pid = None
+
+            # Mem no formato "12.345 K"
+            mem_mb = None
+            if len(parts) >= 5:
+                mem_str = parts[4].replace(".", "").replace("K", "").replace("k", "").strip()
+                try:
+                    mem_kb = int(mem_str)
+                    mem_mb = mem_kb / 1024.0
+                except Exception:
+                    mem_mb = None
+
+            if not name:
+                continue
+
+            procs.append({
+                "pid": pid,
+                "ppid": None,
+                "name": name,
+                "base_name": _base_name(name),
+                "exe": None,
+                "cmdline": None,
+                "username": None,
+                "mem_mb": mem_mb,
+                "create_time": None,
+            })
+
+        if MAX_PROCS > 0 and len(procs) > MAX_PROCS:
+            procs = procs[:MAX_PROCS]
+        return procs
     except Exception:
         return []
 
 
-def post_payload(port: str, payload: dict):
+def post_payload(port: str, payload: dict) -> bool:
     if requests is None:
-        print("requests nÃ£o estÃ¡ instalado. Instale com: pip install requests")
+        print("requests não está instalado. Instale com: pip install requests")
         return False
     try:
         url = f"{POST_URL}?port={port}"
-        r = requests.post(url, data=json.dumps(payload), headers={"Content-Type": "application/json"}, timeout=7)
+        r = requests.post(
+            url,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
         if r.status_code == 200:
             return True
         print(f"Falha HTTP {r.status_code}: {r.text[:200]}")
@@ -204,10 +301,11 @@ if __name__ == "__main__":
             "ip": ip,
             "os": os_name,
             "uptime": uptime,
-            "processes": processes,
+            "processes": processes,  # agora com MUITO mais dados
+            "process_count": len(processes),
             "collected_at": int(time.time()),
         }
 
         ok = post_payload(port, payload)
-        print("OK" if ok else "ERRO", "-", hostname, ip, uptime, f"procs={len(processes)}")
+        print(("OK" if ok else "ERRO"), "-", hostname, ip, uptime, f"procs={len(processes)}")
         time.sleep(SEND_INTERVAL_SEC)
