@@ -62,9 +62,16 @@ POST_TIMEOUT_SEC = float(os.environ.get("AGENT_POST_TIMEOUT_SEC", "10"))
 
 # Quando detecta intrusão, agente para de enviar dados até que o servidor libere
 POLL_ACTION_INTERVAL_SEC = float(os.environ.get(
-    "AGENT_POLL_ACTION_INTERVAL_SEC", "10"))
+    "AGENT_POLL_ACTION_INTERVAL_SEC", "3"))
 # When operator clicks 'ignore', suppress re-alerting for this duration (seconds)
 IGNORE_DURATION_SEC = int(os.environ.get("AGENT_IGNORE_DURATION_SEC", "300"))
+
+# URL do frontend/UI onde o arquivo command.html e as APIs estão disponíveis.
+# Permite configurar onde o agente deve buscar o arquivo de comandos (ex: http://127.0.0.1:3000)
+UI_URL = os.environ.get("IRAMGW_AGENT_UI_URL", "http://127.0.0.1:3000")
+
+# Optional fixed token to authenticate agent requests to the server (16-digit recommended)
+AGENT_TOKEN = os.environ.get("IRAMGW_AGENT_TOKEN", "").strip()
 
 # caminhos possíveis para lista de processos suspeitos (será carregada se existir)
 SUSPICIOUS_LIST_PATHS = [
@@ -106,7 +113,6 @@ SUSPICIOUS_PATTERNS_DEFAULT = [
     "chromeupdate", "chromeupdate.exe",
     # LOLBINS
     "pwsh", "pwsh.exe",
-    "wscript", "wscript.exe",
     "cscript", "cscript.exe",
     "mshta", "mshta.exe",
     "rundll32", "rundll32.exe",
@@ -736,6 +742,253 @@ def poll_action_for_host(port: str, hostname: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _kill_pid(pid_val: int) -> bool:
+    try:
+        system = platform.system().lower()
+        if psutil:
+            try:
+                p = psutil.Process(int(pid_val))
+                p.kill()
+                return True
+            except Exception:
+                return False
+        else:
+            if system == 'windows':
+                try:
+                    subprocess.call(
+                        ['taskkill', '/PID', str(int(pid_val)), '/F'])
+                    return True
+                except Exception:
+                    return False
+            else:
+                try:
+                    subprocess.call(['kill', '-9', str(int(pid_val))])
+                    return True
+                except Exception:
+                    return False
+    except Exception:
+        return False
+
+
+def _kill_by_name(name_val: str) -> bool:
+    try:
+        n = (name_val or '').lower()
+        if not n:
+            return False
+        if psutil:
+            ok = False
+            for p in psutil.process_iter(['name', 'exe']):
+                try:
+                    nm = (p.info.get('name') or '').lower()
+                    exe = (p.info.get('exe') or '') or ''
+                    if n in nm or n in exe.lower():
+                        try:
+                            p.kill()
+                            ok = True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            return ok
+        else:
+            system = platform.system().lower()
+            if system == 'windows':
+                try:
+                    subprocess.call(['taskkill', '/IM', name_val, '/F'])
+                    return True
+                except Exception:
+                    return False
+            else:
+                try:
+                    subprocess.call(['pkill', '-f', name_val])
+                    return True
+                except Exception:
+                    return False
+    except Exception:
+        return False
+
+
+def _remove_file(path_val: str) -> bool:
+    try:
+        if not path_val:
+            return False
+        if os.path.exists(path_val):
+            try:
+                os.remove(path_val)
+                return True
+            except Exception:
+                # try schedule delete on reboot (Windows)
+                try:
+                    if platform.system().lower() == 'windows':
+                        try:
+                            import ctypes
+                            MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+                            p = ctypes.windll.kernel32.MoveFileExW(
+                                str(path_val), None, MOVEFILE_DELAY_UNTIL_REBOOT)
+                            return bool(p)
+                        except Exception:
+                            return False
+                except Exception:
+                    return False
+        return False
+    except Exception:
+        return False
+
+
+def poll_command_html(port: str) -> Optional[str]:
+    """Fetch public/command.html and return the command token (e.g. '1','2','3') for this port if present."""
+    try:
+        candidates = []
+        # prefer explicit UI_URL if configured (useful when server runs on port 3000)
+        try:
+            puc = UI_URL
+            parsed_ui = urlparse(puc)
+            if parsed_ui.hostname:
+                port_ui = parsed_ui.port or (
+                    443 if parsed_ui.scheme == 'https' else 80)
+                candidates.append(
+                    f"{parsed_ui.scheme}://{parsed_ui.hostname}:{port_ui}/command.html")
+        except Exception:
+            pass
+
+        # fallback to same base used for posting (choose_post_url)
+        try:
+            chosen = choose_post_url()
+            parsed = urlparse(chosen)
+            if parsed.hostname:
+                port_ch = parsed.port or (
+                    443 if parsed.scheme == 'https' else 80)
+                candidates.append(
+                    f"{parsed.scheme}://{parsed.hostname}:{port_ch}/command.html")
+        except Exception:
+            pass
+
+        # try each candidate until one returns a matching line
+        if requests:
+            for url in candidates:
+                try:
+                    headers = {}
+                    if AGENT_TOKEN:
+                        headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
+                    r = requests.get(url, headers=headers,
+                                     timeout=POST_TIMEOUT_SEC)
+                    if r.status_code != 200:
+                        continue
+                    for ln in r.text.splitlines():
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        parts = re.split(r"\s+", ln)
+                        if len(parts) >= 2 and parts[0] == str(port):
+                            return parts[1]
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    return None
+
+
+def clear_command_entry(port: str) -> bool:
+    """Request server to clear command lines for this port (calls /api/command/clear)."""
+    try:
+        # try UI_URL first (frontend server where command.html lives)
+        tried = []
+        if requests:
+            try:
+                parsed_ui = urlparse(UI_URL)
+                port_ui = parsed_ui.port or (
+                    443 if parsed_ui.scheme == 'https' else 80)
+                url_ui = f"{parsed_ui.scheme}://{parsed_ui.hostname}:{port_ui}/api/command/clear"
+                tried.append(url_ui)
+                headers = {}
+                if AGENT_TOKEN:
+                    headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
+                r = requests.post(
+                    url_ui, json={"port": str(port)}, headers=headers, timeout=POST_TIMEOUT_SEC)
+                if r.status_code == 200:
+                    try:
+                        return bool(r.json().get('ok'))
+                    except Exception:
+                        return True
+            except Exception:
+                pass
+
+        # fallback to the base used for POST payloads
+        try:
+            chosen = choose_post_url()
+            parsed = urlparse(chosen)
+            root = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+            url = f"{root}/api/command/clear"
+            tried.append(url)
+            headers = {}
+            if AGENT_TOKEN:
+                headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
+            r = requests.post(
+                url, json={"port": str(port)}, headers=headers, timeout=POST_TIMEOUT_SEC)
+            if r.status_code == 200:
+                try:
+                    return bool(r.json().get('ok'))
+                except Exception:
+                    return True
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
+    return False
+
+
+def report_activity(port: str, hostname: str, message: str, command: str, success: bool) -> bool:
+    """Report a textual activity to the server (tries UI_URL then fallback)."""
+    try:
+        payload = {
+            "port": str(port),
+            "hostname": hostname,
+            "message": message,
+            "command": str(command),
+            "success": bool(success)
+        }
+        # try UI first
+        if requests:
+            try:
+                parsed_ui = urlparse(UI_URL)
+                port_ui = parsed_ui.port or (
+                    443 if parsed_ui.scheme == 'https' else 80)
+                url_ui = f"{parsed_ui.scheme}://{parsed_ui.hostname}:{port_ui}/api/pcs/activity"
+                headers = {}
+                if AGENT_TOKEN:
+                    headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
+                r = requests.post(url_ui, json=payload, headers=headers,
+                                  timeout=POST_TIMEOUT_SEC)
+                if r.status_code == 200:
+                    try:
+                        return bool(r.json().get('ok'))
+                    except Exception:
+                        return True
+            except Exception:
+                pass
+
+            try:
+                chosen = choose_post_url()
+                parsed = urlparse(chosen)
+                url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}/api/pcs/activity"
+                headers = {}
+                if AGENT_TOKEN:
+                    headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
+                r = requests.post(url, json=payload,
+                                  headers=headers, timeout=POST_TIMEOUT_SEC)
+                if r.status_code == 200:
+                    try:
+                        return bool(r.json().get('ok'))
+                    except Exception:
+                        return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
 if __name__ == "__main__":
     port = get_port()
     print(f"Using port: {port}")
@@ -816,62 +1069,115 @@ if __name__ == "__main__":
         if blocked:
             # não enviamos mais dados, apenas consultamos o servidor de ações
             try:
-                chosen = choose_post_url()
-                parsed = urlparse(chosen)
-                root = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
-                action_url = f"{root}/pc-action?port={port}&hostname={hostname}"
-                if requests:
-                    r = requests.get(action_url, timeout=POST_TIMEOUT_SEC)
-                    if r.status_code == 200:
-                        try:
-                            j = r.json()
-                            if isinstance(j, dict) and j.get('ok') and j.get('allow'):
-                                action = j.get('action')
-                                target = j.get('target')
-                                print('Action allowed by server:',
-                                      action, target)
-                                if action:
-                                    # if action requests removal but no explicit target provided,
-                                    # use last detected intrusion exe/path or name
-                                    if action and action.startswith('remove') and not target:
-                                        # try to pick exe paths from last_intrusion_procs_full
-                                        chosen_targets: List[str] = []
-                                        for lp in last_intrusion_procs_full:
-                                            exe = lp.get('exe') or ''
-                                            name = lp.get('name') or ''
-                                            if exe:
-                                                chosen_targets.append(exe)
-                                            elif name:
-                                                chosen_targets.append(name)
-                                        # attempt each target (best-effort)
-                                        for t in chosen_targets:
-                                            try:
-                                                perform_action(action, t)
-                                            except Exception:
-                                                pass
-                                    else:
-                                        # special-case: operator requested ignore -> suppress alerts briefly
-                                        if action == 'ignore':
-                                            try:
-                                                suppressed_until = time.time() + float(IGNORE_DURATION_SEC)
-                                                print(
-                                                    f"{now_ts()} Ação 'ignore' recebida; suprimindo alertas até {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(suppressed_until))}")
-                                            except Exception:
-                                                pass
+                # 1) first try the DB-backed /pc-action (existing mechanism)
+                try:
+                    pa = poll_action_for_host(port, hostname)
+                    if pa and isinstance(pa, dict) and pa.get('action'):
+                        action = pa.get('action')
+                        target = pa.get('target')
+                        print('Action allowed by server (pc-action):',
+                              action, target)
+                        if action and action.startswith('remove') and not target:
+                            chosen_targets: List[str] = []
+                            for lp in last_intrusion_procs_full:
+                                exe = lp.get('exe') or ''
+                                name = lp.get('name') or ''
+                                if exe:
+                                    chosen_targets.append(exe)
+                                elif name:
+                                    chosen_targets.append(name)
+                            for t in chosen_targets:
+                                try:
+                                    ok = False
+                                    try:
+                                        if isinstance(t, int) or (isinstance(t, str) and t.isdigit()):
+                                            ok = _kill_pid(int(t))
+                                        elif os.path.exists(str(t)):
+                                            ok = _remove_file(str(t))
                                         else:
-                                            # try to parse target JSON if it's a string containing JSON
-                                            if isinstance(target, str):
-                                                try:
-                                                    target_parsed = json.loads(
-                                                        target)
-                                                    target = target_parsed
-                                                except Exception:
-                                                    pass
-                                            perform_action(action, target)
-                                blocked = False
-                                # after performing action, continue loop (will send normal payload next)
-                        except Exception:
-                            pass
+                                            ok = _kill_by_name(str(t))
+                                    except Exception:
+                                        ok = False
+                                    try:
+                                        msg = f"Arquivo/processo: {t} - {'corrigido' if ok else 'falha ao corrigir'}"
+                                        report_activity(
+                                            port, hostname, msg, action, ok)
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                        else:
+                            if action == 'ignore':
+                                try:
+                                    suppressed_until = time.time() + float(IGNORE_DURATION_SEC)
+                                    try:
+                                        clear_command_entry(port)
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+                # 2) fallback: check public/command.html for "<port> <cmd>" entries
+                try:
+                    cmd = poll_command_html(port)
+                    if cmd:
+                        print(
+                            f"{now_ts()} Command found in command.html for port {port}: {cmd}")
+                        # map commands: 1 -> remove+restart, 2 -> shutdown, 3 -> ignore
+                        if cmd == '1':
+                            # attempt to remove detected intrusion targets (best-effort)
+                            chosen_targets: List[str] = []
+                            for lp in last_intrusion_procs_full:
+                                exe = lp.get('exe') or ''
+                                name = lp.get('name') or ''
+                                if exe:
+                                    chosen_targets.append(exe)
+                                elif name:
+                                    chosen_targets.append(name)
+                            for t in chosen_targets:
+                                try:
+                                    ok = False
+                                    if isinstance(t, int) or (isinstance(t, str) and t.isdigit()):
+                                        ok = _kill_pid(int(t))
+                                    elif os.path.exists(str(t)):
+                                        ok = _remove_file(str(t))
+                                    else:
+                                        ok = _kill_by_name(str(t))
+                                    try:
+                                        msg = f"Arquivo/processo: {t} - {'corrigido' if ok else 'falha ao corrigir'}"
+                                        report_activity(
+                                            port, hostname, msg, '1', ok)
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                            try:
+                                clear_command_entry(port)
+                            except Exception:
+                                pass
+                            perform_action('restart', None)
+                            blocked = False
+                            time.sleep(0)
+                            continue
+                        elif cmd == '2':
+                            try:
+                                clear_command_entry(port)
+                            except Exception:
+                                pass
+                            perform_action('shutdown', None)
+                        elif cmd == '3':
+                            try:
+                                suppressed_until = time.time() + float(IGNORE_DURATION_SEC)
+                                clear_command_entry(port)
+                            except Exception:
+                                pass
+                        blocked = False
+                        time.sleep(0)
+                        continue
+                except Exception:
+                    pass
             except Exception:
                 pass
             time.sleep(POLL_ACTION_INTERVAL_SEC)
@@ -912,6 +1218,57 @@ if __name__ == "__main__":
                 # after performing action, skip sending telemetry this iteration
                 time.sleep(POLL_ACTION_INTERVAL_SEC)
                 continue
+            except Exception:
+                pass
+        else:
+            # if no DB action, also check public/command.html for simple port+cmd entries
+            try:
+                cmd = poll_command_html(port)
+                if cmd:
+                    print(
+                        f"{now_ts()} Command received pre-send from command.html: {cmd}")
+                    if cmd == '1':
+                        chosen_targets: List[str] = []
+                        for lp in last_intrusion_procs_full:
+                            exe = lp.get('exe') or ''
+                            name = lp.get('name') or ''
+                            if exe:
+                                chosen_targets.append(exe)
+                            elif name:
+                                chosen_targets.append(name)
+                        for t in chosen_targets:
+                            try:
+                                if isinstance(t, int) or (isinstance(t, str) and t.isdigit()):
+                                    _kill_pid(int(t))
+                                elif os.path.exists(str(t)):
+                                    _remove_file(str(t))
+                                else:
+                                    _kill_by_name(str(t))
+                            except Exception:
+                                pass
+                        try:
+                            clear_command_entry(port)
+                        except Exception:
+                            pass
+                        perform_action('restart', None)
+                        time.sleep(POLL_ACTION_INTERVAL_SEC)
+                        continue
+                    elif cmd == '2':
+                        try:
+                            clear_command_entry(port)
+                        except Exception:
+                            pass
+                        perform_action('shutdown', None)
+                        time.sleep(POLL_ACTION_INTERVAL_SEC)
+                        continue
+                    elif cmd == '3':
+                        try:
+                            suppressed_until = time.time() + float(IGNORE_DURATION_SEC)
+                            clear_command_entry(port)
+                        except Exception:
+                            pass
+                        time.sleep(POLL_ACTION_INTERVAL_SEC)
+                        continue
             except Exception:
                 pass
 
