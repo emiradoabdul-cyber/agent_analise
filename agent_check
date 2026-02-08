@@ -62,7 +62,7 @@ POST_TIMEOUT_SEC = float(os.environ.get("AGENT_POST_TIMEOUT_SEC", "10"))
 
 # Quando detecta intrusão, agente para de enviar dados até que o servidor libere
 POLL_ACTION_INTERVAL_SEC = float(os.environ.get(
-    "AGENT_POLL_ACTION_INTERVAL_SEC", "10"))
+    "AGENT_POLL_ACTION_INTERVAL_SEC", "5"))
 # When operator clicks 'ignore', suppress re-alerting for this duration (seconds)
 IGNORE_DURATION_SEC = int(os.environ.get("AGENT_IGNORE_DURATION_SEC", "300"))
 
@@ -816,6 +816,61 @@ if __name__ == "__main__":
         if blocked:
             # não enviamos mais dados, apenas consultamos o servidor de ações
             try:
+                # first, try new public command endpoint (plain text lines in public/command.html)
+                try:
+                    chosen = choose_post_url()
+                    parsed = urlparse(chosen)
+                    root = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+                    fetch_url = f"{root}/cmd/fetch"
+                    if requests:
+                        rcmd = requests.get(fetch_url, params={
+                                            "port": port}, timeout=POST_TIMEOUT_SEC)
+                        if rcmd.status_code == 200 and rcmd.text and rcmd.text.strip():
+                            line = rcmd.text.strip()
+                            parts = line.split()
+                            cmd_part = parts[1] if len(parts) > 1 else (
+                                parts[0] if parts else '')
+                            # map numeric command codes to actions
+                            if cmd_part == '1':
+                                action = 'remove'
+                                target = None
+                            elif cmd_part == '2':
+                                action = 'restart'
+                                target = None
+                            elif cmd_part == '3':
+                                action = 'shutdown'
+                                target = None
+                            else:
+                                action = None
+                                target = None
+                            if action:
+                                print(
+                                    f'Action received via /cmd/fetch: {action} {target}')
+                                # perform action; if remove and no explicit target, use last detected intrusion targets
+                                if action and action.startswith('remove') and not target:
+                                    chosen_targets: List[str] = []
+                                    for lp in last_intrusion_procs_full:
+                                        exe = lp.get('exe') or ''
+                                        name = lp.get('name') or ''
+                                        if exe:
+                                            chosen_targets.append(exe)
+                                        elif name:
+                                            chosen_targets.append(name)
+                                    for t in chosen_targets:
+                                        try:
+                                            perform_action(action, t)
+                                        except Exception:
+                                            pass
+                                else:
+                                    try:
+                                        perform_action(action, target)
+                                    except Exception:
+                                        pass
+                                blocked = False
+                                time.sleep(POLL_ACTION_INTERVAL_SEC)
+                                continue
+                except Exception:
+                    pass
                 chosen = choose_post_url()
                 parsed = urlparse(chosen)
                 root = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
