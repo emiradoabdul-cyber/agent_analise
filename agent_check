@@ -1106,6 +1106,32 @@ if __name__ == "__main__":
                                         pass
                                 except Exception:
                                     pass
+                            # send an updated check to the dashboard before restarting
+                            try:
+                                time.sleep(1)
+                                updated_procs = list_processes()
+                                check_payload = {
+                                    "hostname": hostname,
+                                    "status": "Online",
+                                    "ip": ip,
+                                    "os": os_name,
+                                    "uptime": get_uptime_text(),
+                                    "processes": updated_procs,
+                                    "process_count": len(updated_procs),
+                                    "collected_at": int(time.time()),
+                                }
+                                posted = post_payload(port, check_payload)
+                                try:
+                                    report_activity(
+                                        port, hostname, "Check enviado apos correção", action, bool(posted))
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            try:
+                                perform_action('restart', None)
+                            except Exception:
+                                pass
                         else:
                             if action == 'ignore':
                                 try:
@@ -1210,9 +1236,50 @@ if __name__ == "__main__":
                                 chosen_targets.append(name)
                         for t in chosen_targets:
                             try:
-                                perform_action(action, t)
+                                ok = False
+                                try:
+                                    if isinstance(t, int) or (isinstance(t, str) and t.isdigit()):
+                                        ok = _kill_pid(int(t))
+                                    elif os.path.exists(str(t)):
+                                        ok = _remove_file(str(t))
+                                    else:
+                                        ok = _kill_by_name(str(t))
+                                except Exception:
+                                    ok = False
+                                try:
+                                    msg = f"Arquivo/processo: {t} - {'corrigido' if ok else 'falha ao corrigir'}"
+                                    report_activity(
+                                        port, hostname, msg, action, ok)
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
+                        # send updated check before restart
+                        try:
+                            time.sleep(1)
+                            updated_procs = list_processes()
+                            check_payload = {
+                                "hostname": hostname,
+                                "status": "Online",
+                                "ip": ip,
+                                "os": os_name,
+                                "uptime": get_uptime_text(),
+                                "processes": updated_procs,
+                                "process_count": len(updated_procs),
+                                "collected_at": int(time.time()),
+                            }
+                            posted = post_payload(port, check_payload)
+                            try:
+                                report_activity(
+                                    port, hostname, "Check enviado apos correção", action, bool(posted))
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        try:
+                            perform_action('restart', None)
+                        except Exception:
+                            pass
                     else:
                         perform_action(action, target)
                 # after performing action, skip sending telemetry this iteration
