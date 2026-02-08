@@ -387,13 +387,38 @@ def find_suspicious_in_processes(processes: List[Dict[str, Any]], patterns: List
             continue
         lname = name.lower()
         base = (proc.get('base_name') or lname.replace('.exe', '')).lower()
+        # prepare cmdline / exe strings
+        cmdline_val = proc.get('cmdline')
+        cmdline_str = ''
+        try:
+            if isinstance(cmdline_val, (list, tuple)):
+                cmdline_str = ' '.join(str(x) for x in cmdline_val if x)
+            elif cmdline_val:
+                cmdline_str = str(cmdline_val)
+        except Exception:
+            cmdline_str = ''
+        cmdline_str = cmdline_str.lower()
+        exe_str = (proc.get('exe') or '')
+        exe_str = exe_str.lower() if isinstance(exe_str, str) else ''
+
         for p in pats:
             if not p:
                 continue
-            # match by exact base or exact name or substring
+            matched = False
+            # match by exact base or exact name or substring in name
             if base == p or lname == p or p in lname or lname in p:
+                matched = True
+            # also match against cmdline (e.g., python main.py)
+            if not matched and p in cmdline_str:
+                matched = True
+            # also match against exe path
+            if not matched and p in exe_str:
+                matched = True
+
+            if matched:
                 if name not in found:
                     found.append(name)
+    return found
     return found
 
 
