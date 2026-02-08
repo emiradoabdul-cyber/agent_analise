@@ -9,7 +9,7 @@ import sys
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 
-print("TEST VERSION")
+print("TEST VERSION 4")
 
 
 def _script_dir() -> str:
@@ -101,7 +101,6 @@ SUSPICIOUS_PATTERNS_DEFAULT = [
     "taskmngr", "taskmngr.exe",
     "spoolsvc", "spoolsvc.exe",
     "serviceshost", "serviceshost.exe",
-    "system32", "system32.exe",
     "chromeupdate", "chromeupdate.exe",
     # LOLBINS
     "pwsh", "pwsh.exe",
@@ -714,6 +713,27 @@ def post_payload(port: str, payload: dict) -> bool:
         return False
 
 
+def poll_action_for_host(port: str, hostname: str) -> Optional[Dict[str, Any]]:
+    """Consulta /pc-action e retorna dict { action, target } quando disponível, senão None."""
+    try:
+        chosen = choose_post_url()
+        parsed = urlparse(chosen)
+        root = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        action_url = f"{root}/pc-action?port={port}&hostname={hostname}"
+        if requests:
+            r = requests.get(action_url, timeout=POST_TIMEOUT_SEC)
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and j.get('ok') and j.get('allow'):
+                        return {'action': j.get('action'), 'target': j.get('target')}
+                except Exception:
+                    return None
+    except Exception:
+        return None
+    return None
+
+
 if __name__ == "__main__":
     port = get_port()
     print(f"Using port: {port}")
@@ -839,6 +859,43 @@ if __name__ == "__main__":
             continue
 
         # normal payload (quando não bloqueado)
+        # Before sending normal payload, poll server for any pending action for this host
+        pa = poll_action_for_host(port, hostname)
+        if pa and isinstance(pa, dict) and pa.get('action'):
+            try:
+                action = pa.get('action')
+                target = pa.get('target')
+                print(f"{now_ts()} Action received pre-send: {action} {target}")
+                # try to parse target JSON string
+                if isinstance(target, str):
+                    try:
+                        target = json.loads(target)
+                    except Exception:
+                        pass
+                if action:
+                    if action and action.startswith('remove') and not target:
+                        # fallback to last intrusion targets
+                        chosen_targets: List[str] = []
+                        for lp in last_intrusion_procs_full:
+                            exe = lp.get('exe') or ''
+                            name = lp.get('name') or ''
+                            if exe:
+                                chosen_targets.append(exe)
+                            elif name:
+                                chosen_targets.append(name)
+                        for t in chosen_targets:
+                            try:
+                                perform_action(action, t)
+                            except Exception:
+                                pass
+                    else:
+                        perform_action(action, target)
+                # after performing action, skip sending telemetry this iteration
+                time.sleep(POLL_ACTION_INTERVAL_SEC)
+                continue
+            except Exception:
+                pass
+
         payload = {
             "hostname": hostname,
             "status": "Online",
