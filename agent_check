@@ -46,7 +46,7 @@ POST_URL = os.environ.get("IRAMGW_AGENT_CHECK_URL",
 
 # Localhost (testes) - se estiver online, usa ele primeiro
 LOCAL_POST_URL = os.environ.get(
-    "IRAMGW_AGENT_LOCAL_URL", "http://127.0.0.1:4444/pc-check")
+    "IRAMGW_AGENT_LOCAL_URL", "http://localhost:4444/pc-check")
 
 SEND_INTERVAL_SEC = int(os.environ.get("AGENT_SEND_INTERVAL_SEC", "60"))
 
