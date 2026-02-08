@@ -251,6 +251,13 @@ def get_uptime_text() -> str:
         return ""
 
 
+def now_ts() -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    except Exception:
+        return str(int(time.time()))
+
+
 def get_os_name() -> str:
     try:
         system = platform.system() or "Windows"
@@ -469,9 +476,16 @@ def _normalize_pattern(s: str) -> str:
 
 
 def find_suspicious_in_processes(processes: List[Dict[str, Any]], patterns: List[str]) -> List[str]:
-    found: List[str] = []
+    # simple list of matching process names (kept for compatibility)
+    details = find_suspicious_details(processes, patterns)
+    return [d['name'] for d in details]
+
+
+def find_suspicious_details(processes: List[Dict[str, Any]], patterns: List[str]) -> List[Dict[str, Any]]:
+    """Return list of { name: <proc name>, matches: [pattern, ...] }"""
+    results: List[Dict[str, Any]] = []
     if not patterns:
-        return found
+        return results
     pats = set(_normalize_pattern(p) for p in patterns if p)
     for proc in processes:
         name = (proc.get('name') or '').strip()
@@ -479,6 +493,7 @@ def find_suspicious_in_processes(processes: List[Dict[str, Any]], patterns: List
             continue
         lname = name.lower()
         base = (proc.get('base_name') or lname.replace('.exe', '')).lower()
+
         # prepare cmdline / exe strings
         cmdline_val = proc.get('cmdline')
         cmdline_str = ''
@@ -493,25 +508,25 @@ def find_suspicious_in_processes(processes: List[Dict[str, Any]], patterns: List
         exe_str = (proc.get('exe') or '')
         exe_str = exe_str.lower() if isinstance(exe_str, str) else ''
 
+        # Strict matching: only consider exact base/name matches (or .exe exact)
+        matched_patterns: List[str] = []
         for p in pats:
             if not p:
                 continue
-            matched = False
-            # match by exact base or exact name or substring in name
-            if base == p or lname == p or p in lname or lname in p:
-                matched = True
-            # also match against cmdline (e.g., python main.py)
-            if not matched and p in cmdline_str:
-                matched = True
-            # also match against exe path
-            if not matched and p in exe_str:
-                matched = True
+            # if pattern contains .exe, require full name match or base match without .exe
+            if p.endswith('.exe'):
+                if lname == p or base == p[:-4]:
+                    matched_patterns.append(p)
+                continue
 
-            if matched:
-                if name not in found:
-                    found.append(name)
-    return found
-    return found
+            # otherwise require exact base or full name match
+            if base == p or lname == p:
+                matched_patterns.append(p)
+
+        if matched_patterns:
+            results.append({"name": name, "matches": matched_patterns})
+
+    return results
 
 
 def perform_action(action: str, target: Optional[str]) -> bool:
@@ -609,9 +624,25 @@ if __name__ == "__main__":
         uptime = get_uptime_text()
         processes = list_processes()
 
+        # debug: announce comparison and list processes one-per-line
+        print(
+            f"{now_ts()} Comparando processos antes de enviar... (total: {len(processes)})")
+        print(f"{now_ts()} Lista de processos detectados:")
+        for p in processes:
+            try:
+                pname = p.get('name') or p.get('base_name') or ''
+            except Exception:
+                pname = str(p)
+            print(f"{now_ts()} - {pname}")
+
         # detectar processos intrusos localmente se tivermos padrões
-        intrusion_procs = find_suspicious_in_processes(
+        intrusion_details = find_suspicious_details(
             processes, suspicious_patterns)
+        intrusion_procs = [d['name'] for d in intrusion_details]
+        if intrusion_details:
+            for d in intrusion_details:
+                print(
+                    f"{now_ts()} PERIGO --> Processo: {d['name']} encontrado... AGUARDANDO AÇÃO NA DASH")
         if intrusion_procs and not blocked:
             # enviar alerta único e entrar em modo bloqueado
             alert_payload = {
@@ -628,9 +659,12 @@ if __name__ == "__main__":
                 "blocked": True,
             }
             ok = post_payload(port, alert_payload)
-            print(("ALERT SENT" if ok else "ALERT ERRO"),
-                  "-", hostname, intrusion_procs)
+            print(
+                f"{now_ts()} {('ALERT SENT' if ok else 'ALERT ERRO')} - {hostname} {intrusion_procs}")
             blocked = True
+            # immediately enter blocked polling
+            time.sleep(POLL_ACTION_INTERVAL_SEC)
+            continue
 
         if blocked:
             # não enviamos mais dados, apenas consultamos o servidor de ações
@@ -673,6 +707,8 @@ if __name__ == "__main__":
         }
 
         ok = post_payload(port, payload)
-        print(("OK" if ok else "ERRO"), "-", hostname,
-              ip, uptime, f"procs={len(processes)}")
+        if ok:
+            print(f"{now_ts()} OK --> Dados enviados com sucesso")
+        else:
+            print(f"{now_ts()} ERRO --> Falha ao enviar dados")
         time.sleep(SEND_INTERVAL_SEC)
