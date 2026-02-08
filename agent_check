@@ -419,16 +419,37 @@ def choose_post_url() -> str:
     1) Se localhost estiver respondendo -> usa LOCAL_POST_URL
     2) Caso contrário -> usa POST_URL (servidor)
     """
-    # Só vale tentar localhost se realmente for localhost/127.0.0.1
+    # Try LOCAL_POST_URL first when it points to localhost, then UI_URL if local, otherwise fallback to POST_URL.
     try:
-        host = (urlparse(LOCAL_POST_URL).hostname or "").lower()
-        is_local = host in ("localhost", "127.0.0.1")
+        # prefer explicit LOCAL_POST_URL when it's a localhost address
+        parsed_local = urlparse(LOCAL_POST_URL)
+        local_host = (parsed_local.hostname or "").lower()
+        if local_host in ("localhost", "127.0.0.1"):
+            try:
+                if _is_url_reachable_http(LOCAL_POST_URL, LOCAL_CHECK_TIMEOUT_SEC):
+                    print(
+                        f"{now_ts()} choose_post_url: using LOCAL_POST_URL {LOCAL_POST_URL}")
+                    return LOCAL_POST_URL
+            except Exception:
+                pass
     except Exception:
-        is_local = False
+        pass
 
-    if is_local and _is_url_reachable_http(LOCAL_POST_URL, LOCAL_CHECK_TIMEOUT_SEC):
-        return LOCAL_POST_URL
+    # if UI_URL is explicitly local, prefer it next (useful when UI server hosts endpoints)
+    try:
+        parsed_ui = urlparse(UI_URL)
+        ui_host = (parsed_ui.hostname or "").lower()
+        if ui_host in ("localhost", "127.0.0.1"):
+            try:
+                if _is_url_reachable_http(UI_URL, LOCAL_CHECK_TIMEOUT_SEC):
+                    print(f"{now_ts()} choose_post_url: using UI_URL {UI_URL}")
+                    return UI_URL
+            except Exception:
+                pass
+    except Exception:
+        pass
 
+    print(f"{now_ts()} choose_post_url: using remote POST_URL {POST_URL}")
     return POST_URL
 
 
@@ -514,188 +535,33 @@ def find_suspicious_details(processes: List[Dict[str, Any]], patterns: List[str]
         exe_str = (proc.get('exe') or '')
         exe_str = exe_str.lower() if isinstance(exe_str, str) else ''
 
-        # Strict matching: only consider exact base/name matches (or .exe exact)
         matched_patterns: List[str] = []
         for p in pats:
             if not p:
                 continue
-            # if pattern contains .exe, require full name match or base match without .exe
-            if p.endswith('.exe'):
-                if lname == p or base == p[:-4]:
-                    matched_patterns.append(p)
+            try:
+                # Normalize pattern and compare strictly to process base name or exe basename.
+                if p.endswith('.exe'):
+                    core = p[:-4]
+                    exe_basename = os.path.basename(exe_str) if exe_str else ''
+                    if base == core or exe_basename.lower() == p:
+                        matched_patterns.append(p)
+                else:
+                    exe_basename = os.path.basename(exe_str) if exe_str else ''
+                    if base == p or exe_basename.lower() == p:
+                        matched_patterns.append(p)
+            except Exception:
                 continue
 
-            # otherwise require exact base or full name match
-            if base == p or lname == p:
-                matched_patterns.append(p)
-
         if matched_patterns:
-            results.append({"name": name, "matches": matched_patterns})
+            results.append({
+                'name': name,
+                'pid': proc.get('pid'),
+                'exe': proc.get('exe'),
+                'matches': matched_patterns,
+            })
 
     return results
-
-
-def perform_action(action: str, target: Optional[str]) -> bool:
-    """Executa ação no host. Retorna True se executado (não necessariamente com sucesso total)."""
-    try:
-        system = platform.system().lower()
-        if action == 'restart':
-            if system == 'windows':
-                subprocess.Popen(['shutdown', '/r', '/t', '5'])
-            else:
-                subprocess.Popen(['shutdown', '-r', 'now'])
-            return True
-        if action == 'shutdown':
-            if system == 'windows':
-                subprocess.Popen(['shutdown', '/s', '/t', '5'])
-            else:
-                subprocess.Popen(['shutdown', '-h', 'now'])
-            return True
-        if action and action.startswith('remove'):
-            # target can be None, a string, or a dict (with pid, exe, name)
-            t = target
-            # if target is a JSON string, try to parse
-            if isinstance(t, str):
-                try:
-                    import json as _json
-                    parsed = _json.loads(t)
-                    t = parsed
-                except Exception:
-                    t = t.strip()
-
-            # helper: kill by pid
-            def kill_pid(pid_val: int):
-                try:
-                    if psutil:
-                        try:
-                            p = psutil.Process(int(pid_val))
-                            p.kill()
-                            return True
-                        except Exception:
-                            return False
-                    else:
-                        if system == 'windows':
-                            try:
-                                subprocess.call(
-                                    ['taskkill', '/PID', str(int(pid_val)), '/F'])
-                                return True
-                            except Exception:
-                                return False
-                        else:
-                            try:
-                                subprocess.call(
-                                    ['kill', '-9', str(int(pid_val))])
-                                return True
-                            except Exception:
-                                return False
-                except Exception:
-                    return False
-
-            # helper: kill by name substring
-            def kill_by_name(name_val: str):
-                try:
-                    n = (name_val or '').lower()
-                    if not n:
-                        return False
-                    if psutil:
-                        ok = False
-                        for p in psutil.process_iter(['name', 'exe']):
-                            try:
-                                nm = (p.info.get('name') or '').lower()
-                                exe = (p.info.get('exe') or '') or ''
-                                if n in nm or n in exe.lower():
-                                    try:
-                                        p.kill()
-                                        ok = True
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-                        return ok
-                    else:
-                        if system == 'windows':
-                            try:
-                                subprocess.call(
-                                    ['taskkill', '/IM', name_val, '/F'])
-                                return True
-                            except Exception:
-                                return False
-                        else:
-                            try:
-                                subprocess.call(['pkill', '-f', name_val])
-                                return True
-                            except Exception:
-                                return False
-                except Exception:
-                    return False
-
-            # helper: remove file and fallback to schedule deletion on Windows
-            def remove_file(path_val: str):
-                try:
-                    if not path_val:
-                        return False
-                    if os.path.exists(path_val):
-                        try:
-                            os.remove(path_val)
-                            return True
-                        except Exception:
-                            # try schedule delete on reboot (Windows)
-                            try:
-                                if system == 'windows':
-                                    try:
-                                        import ctypes
-                                        MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
-                                        p = ctypes.windll.kernel32.MoveFileExW(
-                                            str(path_val), None, MOVEFILE_DELAY_UNTIL_REBOOT)
-                                        return bool(p)
-                                    except Exception:
-                                        return False
-                            except Exception:
-                                return False
-                    return False
-                except Exception:
-                    return False
-
-            # process target
-            if isinstance(t, dict):
-                # try pid first
-                pid_val = t.get('pid')
-                exe_val = t.get('exe') or t.get('path') or t.get('name')
-                name_val = t.get('name')
-                if pid_val:
-                    try:
-                        kill_pid(int(pid_val))
-                    except Exception:
-                        pass
-                if exe_val:
-                    try:
-                        remove_file(exe_val)
-                    except Exception:
-                        pass
-                if not pid_val and name_val:
-                    try:
-                        kill_by_name(name_val)
-                    except Exception:
-                        pass
-            else:
-                # t can be a string name/path
-                if isinstance(t, str) and t:
-                    # if looks like a path, try remove; otherwise kill by name
-                    if os.path.exists(t):
-                        try:
-                            remove_file(t)
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            kill_by_name(t)
-                        except Exception:
-                            pass
-            # then restart
-            return perform_action('restart', None)
-    except Exception:
-        return False
-    return False
 
 
 def post_payload(port: str, payload: dict) -> bool:
@@ -808,6 +674,33 @@ def _kill_by_name(name_val: str) -> bool:
         return False
 
 
+def _kill_by_exe(exe_path: str) -> bool:
+    """Kill processes whose executable path matches exe_path exactly (best-effort)."""
+    try:
+        if not exe_path:
+            return False
+        if psutil:
+            ok = False
+            norm_target = os.path.normcase(str(exe_path))
+            for p in psutil.process_iter(['pid', 'exe', 'name']):
+                try:
+                    pe = (p.info.get('exe') or '')
+                    if not pe:
+                        continue
+                    if os.path.normcase(pe) == norm_target:
+                        try:
+                            p.kill()
+                            ok = True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            return ok
+        return False
+    except Exception:
+        return False
+
+
 def _remove_file(path_val: str) -> bool:
     try:
         if not path_val:
@@ -830,6 +723,52 @@ def _remove_file(path_val: str) -> bool:
                             return False
                 except Exception:
                     return False
+        return False
+    except Exception:
+        return False
+
+
+def perform_action(action: str, target: Optional[Any]) -> bool:
+    """Perform system actions: 'restart' or 'shutdown'. Returns True if the command was issued."""
+    try:
+        system = platform.system().lower()
+        act = (action or '').lower()
+        print(f"{now_ts()} Performing action: {act} target={target}")
+        if act == 'restart':
+            if system == 'windows':
+                try:
+                    subprocess.call(['shutdown', '/r', '/t', '0'])
+                    return True
+                except Exception:
+                    return False
+            else:
+                try:
+                    subprocess.call(['shutdown', '-r', 'now'])
+                    return True
+                except Exception:
+                    try:
+                        subprocess.call(['reboot'])
+                        return True
+                    except Exception:
+                        return False
+        if act == 'shutdown':
+            if system == 'windows':
+                try:
+                    subprocess.call(['shutdown', '/s', '/t', '0'])
+                    return True
+                except Exception:
+                    return False
+            else:
+                try:
+                    subprocess.call(['shutdown', '-h', 'now'])
+                    return True
+                except Exception:
+                    try:
+                        subprocess.call(['poweroff'])
+                        return True
+                    except Exception:
+                        return False
+        print(f"{now_ts()} Unknown action: {action}")
         return False
     except Exception:
         return False
@@ -1086,6 +1025,7 @@ if __name__ == "__main__":
                                     chosen_targets.append(exe)
                                 elif name:
                                     chosen_targets.append(name)
+                            results: List[bool] = []
                             for t in chosen_targets:
                                 try:
                                     ok = False
@@ -1104,10 +1044,13 @@ if __name__ == "__main__":
                                             port, hostname, msg, action, ok)
                                     except Exception:
                                         pass
+                                    results.append(bool(ok))
                                 except Exception:
                                     pass
-                            # send an updated check to the dashboard before restarting
+                            # send an updated check to the dashboard before deciding to restart
                             try:
+                                print(
+                                    f"{now_ts()} Enviando check atualizado para a Dash...")
                                 time.sleep(1)
                                 updated_procs = list_processes()
                                 check_payload = {
@@ -1121,6 +1064,8 @@ if __name__ == "__main__":
                                     "collected_at": int(time.time()),
                                 }
                                 posted = post_payload(port, check_payload)
+                                print(
+                                    f"{now_ts()} Check atualizado enviado: {posted}")
                                 try:
                                     report_activity(
                                         port, hostname, "Check enviado apos correção", action, bool(posted))
@@ -1128,8 +1073,22 @@ if __name__ == "__main__":
                                     pass
                             except Exception:
                                 pass
+                            # only restart if all targets were corrected
                             try:
-                                perform_action('restart', None)
+                                all_ok = (len(results) > 0 and all(results))
+                                if all_ok:
+                                    print(
+                                        f"{now_ts()} Todos os alvos corrigidos — reiniciando em 10s...")
+                                    time.sleep(10)
+                                    perform_action('restart', None)
+                                else:
+                                    print(
+                                        f"{now_ts()} Correção incompleta — NÃO será reiniciado. result list: {results}")
+                                    try:
+                                        report_activity(
+                                            port, hostname, f"Correção incompleta: {results}", action, False)
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                         else:
@@ -1162,28 +1121,102 @@ if __name__ == "__main__":
                                     chosen_targets.append(exe)
                                 elif name:
                                     chosen_targets.append(name)
+                            results: List[bool] = []
                             for t in chosen_targets:
                                 try:
-                                    ok = False
-                                    if isinstance(t, int) or (isinstance(t, str) and t.isdigit()):
-                                        ok = _kill_pid(int(t))
-                                    elif os.path.exists(str(t)):
-                                        ok = _remove_file(str(t))
-                                    else:
-                                        ok = _kill_by_name(str(t))
+                                    print(
+                                        f"{now_ts()} Comando recebido: executar correção para: {t}")
+                                    ok_kill = False
+                                    try:
+                                        if isinstance(t, int) or (isinstance(t, str) and t.isdigit()):
+                                            pid_val = int(t)
+                                            print(
+                                                f"{now_ts()} Parando PID {pid_val}...")
+                                            ok_kill = _kill_pid(pid_val)
+                                        elif os.path.exists(str(t)):
+                                            print(
+                                                f"{now_ts()} Parando processos que usam o exe {t}...")
+                                            ok_kill = _kill_by_exe(str(t))
+                                        else:
+                                            print(
+                                                f"{now_ts()} Parando por nome: {t}...")
+                                            ok_kill = _kill_by_name(str(t))
+                                    except Exception:
+                                        ok_kill = False
+
+                                    ok_remove = False
+                                    try:
+                                        if os.path.exists(str(t)):
+                                            print(
+                                                f"{now_ts()} Tentando apagar arquivo {t}...")
+                                            ok_remove = _remove_file(str(t))
+                                            print(
+                                                f"{now_ts()} Remoção {'ok' if ok_remove else 'falhou'}")
+                                        else:
+                                            print(
+                                                f"{now_ts()} Arquivo {t} não existe, pular remoção")
+                                    except Exception:
+                                        ok_remove = False
+
+                                    ok = bool(ok_kill or ok_remove)
                                     try:
                                         msg = f"Arquivo/processo: {t} - {'corrigido' if ok else 'falha ao corrigir'}"
+                                        print(f"{now_ts()} {msg} (comando: 1)")
                                         report_activity(
                                             port, hostname, msg, '1', ok)
                                     except Exception:
                                         pass
+                                    results.append(bool(ok))
                                 except Exception:
                                     pass
                             try:
                                 clear_command_entry(port)
                             except Exception:
                                 pass
-                            perform_action('restart', None)
+                            # send updated check
+                            try:
+                                print(
+                                    f"{now_ts()} Enviando check atualizado para a Dash...")
+                                time.sleep(1)
+                                updated_procs = list_processes()
+                                check_payload = {
+                                    "hostname": hostname,
+                                    "status": "Online",
+                                    "ip": ip,
+                                    "os": os_name,
+                                    "uptime": get_uptime_text(),
+                                    "processes": updated_procs,
+                                    "process_count": len(updated_procs),
+                                    "collected_at": int(time.time()),
+                                }
+                                posted = post_payload(port, check_payload)
+                                print(
+                                    f"{now_ts()} Check atualizado enviado: {posted}")
+                                try:
+                                    report_activity(
+                                        port, hostname, "Check enviado apos correção", '1', bool(posted))
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            # decide whether to restart: only when all targets were corrected
+                            try:
+                                all_ok = (len(results) > 0 and all(results))
+                                if all_ok:
+                                    print(
+                                        f"{now_ts()} Todos os alvos corrigidos — reiniciando em 10s...")
+                                    time.sleep(10)
+                                    perform_action('restart', None)
+                                else:
+                                    print(
+                                        f"{now_ts()} Correção incompleta — NÃO será reiniciado. result list: {results}")
+                                    try:
+                                        report_activity(
+                                            port, hostname, f"Correção incompleta: {results}", '1', False)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                             blocked = False
                             time.sleep(0)
                             continue
