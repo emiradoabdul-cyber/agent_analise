@@ -63,6 +63,8 @@ POST_TIMEOUT_SEC = float(os.environ.get("AGENT_POST_TIMEOUT_SEC", "10"))
 # Quando detecta intrusão, agente para de enviar dados até que o servidor libere
 POLL_ACTION_INTERVAL_SEC = float(os.environ.get(
     "AGENT_POLL_ACTION_INTERVAL_SEC", "10"))
+# When operator clicks 'ignore', suppress re-alerting for this duration (seconds)
+IGNORE_DURATION_SEC = int(os.environ.get("AGENT_IGNORE_DURATION_SEC", "300"))
 
 # caminhos possíveis para lista de processos suspeitos (será carregada se existir)
 SUSPICIOUS_LIST_PATHS = [
@@ -750,6 +752,7 @@ if __name__ == "__main__":
     blocked = False
     # persist last detected intrusion processes/details so actions can use them
     last_intrusion_procs_full: List[Dict[str, Any]] = []
+    suppressed_until = 0.0  # timestamp until which intrusion alerts are suppressed
 
     while True:
         uptime = get_uptime_text()
@@ -776,6 +779,13 @@ if __name__ == "__main__":
                 p.get('name') or '').strip() in intrusion_procs]
         else:
             last_intrusion_procs_full = []
+        # if we are currently suppressed (operator clicked ignore), skip alerting
+        if suppressed_until and time.time() < suppressed_until:
+            if intrusion_details:
+                print(f"{now_ts()} Ignorado localmente até {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(suppressed_until))} - não envia ALERT")
+            # clear intrusion lists so they don't trigger blocking
+            intrusion_details = []
+            intrusion_procs = []
         if intrusion_details:
             for d in intrusion_details:
                 print(
@@ -840,15 +850,24 @@ if __name__ == "__main__":
                                             except Exception:
                                                 pass
                                     else:
-                                        # try to parse target JSON if it's a string containing JSON
-                                        if isinstance(target, str):
+                                        # special-case: operator requested ignore -> suppress alerts briefly
+                                        if action == 'ignore':
                                             try:
-                                                target_parsed = json.loads(
-                                                    target)
-                                                target = target_parsed
+                                                suppressed_until = time.time() + float(IGNORE_DURATION_SEC)
+                                                print(
+                                                    f"{now_ts()} Ação 'ignore' recebida; suprimindo alertas até {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(suppressed_until))}")
                                             except Exception:
                                                 pass
-                                        perform_action(action, target)
+                                        else:
+                                            # try to parse target JSON if it's a string containing JSON
+                                            if isinstance(target, str):
+                                                try:
+                                                    target_parsed = json.loads(
+                                                        target)
+                                                    target = target_parsed
+                                                except Exception:
+                                                    pass
+                                            perform_action(action, target)
                                 blocked = False
                                 # after performing action, continue loop (will send normal payload next)
                         except Exception:
