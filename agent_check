@@ -86,7 +86,6 @@ SUSPICIOUS_PATTERNS_DEFAULT = [
     "loader", "loader.exe",
     "run", "run.exe",
     "task", "task.exe",
-    "system", "system.exe",
     "app", "app.exe",
     "agent", "agent.exe",
     "helper", "helper.exe",
@@ -545,36 +544,146 @@ def perform_action(action: str, target: Optional[str]) -> bool:
             else:
                 subprocess.Popen(['shutdown', '-h', 'now'])
             return True
-        if action == 'remove_and_restart' or action == 'kill_remove_restart':
-            # attempt to kill processes by name (target) and remove file if path provided
-            if target:
-                t = target.strip()
-                # kill processes matching target name
-                if psutil:
-                    for p in psutil.process_iter(['name', 'exe']):
-                        try:
-                            nm = (p.info.get('name') or '').lower()
-                            exe = (p.info.get('exe') or '').lower()
-                            if t.lower() in nm or t.lower() in exe:
-                                try:
-                                    p.kill()
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                else:
-                    # best-effort using taskkill on Windows
-                    if system == 'windows':
-                        try:
-                            subprocess.call(['taskkill', '/IM', t, '/F'])
-                        except Exception:
-                            pass
-                # try remove file if path exists
+        if action and action.startswith('remove'):
+            # target can be None, a string, or a dict (with pid, exe, name)
+            t = target
+            # if target is a JSON string, try to parse
+            if isinstance(t, str):
                 try:
-                    if os.path.exists(t):
-                        os.remove(t)
+                    import json as _json
+                    parsed = _json.loads(t)
+                    t = parsed
                 except Exception:
-                    pass
+                    t = t.strip()
+
+            # helper: kill by pid
+            def kill_pid(pid_val: int):
+                try:
+                    if psutil:
+                        try:
+                            p = psutil.Process(int(pid_val))
+                            p.kill()
+                            return True
+                        except Exception:
+                            return False
+                    else:
+                        if system == 'windows':
+                            try:
+                                subprocess.call(
+                                    ['taskkill', '/PID', str(int(pid_val)), '/F'])
+                                return True
+                            except Exception:
+                                return False
+                        else:
+                            try:
+                                subprocess.call(
+                                    ['kill', '-9', str(int(pid_val))])
+                                return True
+                            except Exception:
+                                return False
+                except Exception:
+                    return False
+
+            # helper: kill by name substring
+            def kill_by_name(name_val: str):
+                try:
+                    n = (name_val or '').lower()
+                    if not n:
+                        return False
+                    if psutil:
+                        ok = False
+                        for p in psutil.process_iter(['name', 'exe']):
+                            try:
+                                nm = (p.info.get('name') or '').lower()
+                                exe = (p.info.get('exe') or '') or ''
+                                if n in nm or n in exe.lower():
+                                    try:
+                                        p.kill()
+                                        ok = True
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        return ok
+                    else:
+                        if system == 'windows':
+                            try:
+                                subprocess.call(
+                                    ['taskkill', '/IM', name_val, '/F'])
+                                return True
+                            except Exception:
+                                return False
+                        else:
+                            try:
+                                subprocess.call(['pkill', '-f', name_val])
+                                return True
+                            except Exception:
+                                return False
+                except Exception:
+                    return False
+
+            # helper: remove file and fallback to schedule deletion on Windows
+            def remove_file(path_val: str):
+                try:
+                    if not path_val:
+                        return False
+                    if os.path.exists(path_val):
+                        try:
+                            os.remove(path_val)
+                            return True
+                        except Exception:
+                            # try schedule delete on reboot (Windows)
+                            try:
+                                if system == 'windows':
+                                    try:
+                                        import ctypes
+                                        MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+                                        p = ctypes.windll.kernel32.MoveFileExW(
+                                            str(path_val), None, MOVEFILE_DELAY_UNTIL_REBOOT)
+                                        return bool(p)
+                                    except Exception:
+                                        return False
+                            except Exception:
+                                return False
+                    return False
+                except Exception:
+                    return False
+
+            # process target
+            if isinstance(t, dict):
+                # try pid first
+                pid_val = t.get('pid')
+                exe_val = t.get('exe') or t.get('path') or t.get('name')
+                name_val = t.get('name')
+                if pid_val:
+                    try:
+                        kill_pid(int(pid_val))
+                    except Exception:
+                        pass
+                if exe_val:
+                    try:
+                        remove_file(exe_val)
+                    except Exception:
+                        pass
+                if not pid_val and name_val:
+                    try:
+                        kill_by_name(name_val)
+                    except Exception:
+                        pass
+            else:
+                # t can be a string name/path
+                if isinstance(t, str) and t:
+                    # if looks like a path, try remove; otherwise kill by name
+                    if os.path.exists(t):
+                        try:
+                            remove_file(t)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            kill_by_name(t)
+                        except Exception:
+                            pass
             # then restart
             return perform_action('restart', None)
     except Exception:
@@ -619,6 +728,8 @@ if __name__ == "__main__":
         print(f"Loaded {len(suspicious_patterns)} suspicious patterns")
 
     blocked = False
+    # persist last detected intrusion processes/details so actions can use them
+    last_intrusion_procs_full: List[Dict[str, Any]] = []
 
     while True:
         uptime = get_uptime_text()
@@ -639,6 +750,12 @@ if __name__ == "__main__":
         intrusion_details = find_suspicious_details(
             processes, suspicious_patterns)
         intrusion_procs = [d['name'] for d in intrusion_details]
+        # collect full process dicts for the detected intrusion processes
+        if intrusion_procs:
+            last_intrusion_procs_full = [p for p in processes if (
+                p.get('name') or '').strip() in intrusion_procs]
+        else:
+            last_intrusion_procs_full = []
         if intrusion_details:
             for d in intrusion_details:
                 print(
@@ -684,7 +801,34 @@ if __name__ == "__main__":
                                 print('Action allowed by server:',
                                       action, target)
                                 if action:
-                                    perform_action(action, target)
+                                    # if action requests removal but no explicit target provided,
+                                    # use last detected intrusion exe/path or name
+                                    if action and action.startswith('remove') and not target:
+                                        # try to pick exe paths from last_intrusion_procs_full
+                                        chosen_targets: List[str] = []
+                                        for lp in last_intrusion_procs_full:
+                                            exe = lp.get('exe') or ''
+                                            name = lp.get('name') or ''
+                                            if exe:
+                                                chosen_targets.append(exe)
+                                            elif name:
+                                                chosen_targets.append(name)
+                                        # attempt each target (best-effort)
+                                        for t in chosen_targets:
+                                            try:
+                                                perform_action(action, t)
+                                            except Exception:
+                                                pass
+                                    else:
+                                        # try to parse target JSON if it's a string containing JSON
+                                        if isinstance(target, str):
+                                            try:
+                                                target_parsed = json.loads(
+                                                    target)
+                                                target = target_parsed
+                                            except Exception:
+                                                pass
+                                        perform_action(action, target)
                                 blocked = False
                                 # after performing action, continue loop (will send normal payload next)
                         except Exception:
