@@ -9,6 +9,7 @@ import sys
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 
+
 def _script_dir() -> str:
     # 1) PyInstaller (rodando como .exe)
     if getattr(sys, "frozen", False):
@@ -38,10 +39,12 @@ except Exception:
 # Config
 # ----------------------------
 # Server principal (produção)
-POST_URL = os.environ.get("IRAMGW_AGENT_CHECK_URL", "http://104.234.30.69:4444/pc-check")
+POST_URL = os.environ.get("IRAMGW_AGENT_CHECK_URL",
+                          "http://104.234.30.69:4444/pc-check")
 
 # Localhost (testes) - se estiver online, usa ele primeiro
-LOCAL_POST_URL = os.environ.get("IRAMGW_AGENT_LOCAL_URL", "http://127.0.0.1:4444/pc-check")
+LOCAL_POST_URL = os.environ.get(
+    "IRAMGW_AGENT_LOCAL_URL", "http://127.0.0.1:4444/pc-check")
 
 SEND_INTERVAL_SEC = int(os.environ.get("AGENT_SEND_INTERVAL_SEC", "60"))
 
@@ -49,10 +52,22 @@ SEND_INTERVAL_SEC = int(os.environ.get("AGENT_SEND_INTERVAL_SEC", "60"))
 MAX_PROCS = int(os.environ.get("AGENT_MAX_PROCS", "500"))
 
 # Timeout curto para checar localhost (não pode travar o agente)
-LOCAL_CHECK_TIMEOUT_SEC = float(os.environ.get("AGENT_LOCAL_CHECK_TIMEOUT_SEC", "0.6"))
+LOCAL_CHECK_TIMEOUT_SEC = float(os.environ.get(
+    "AGENT_LOCAL_CHECK_TIMEOUT_SEC", "0.6"))
 
 # Timeout do POST
 POST_TIMEOUT_SEC = float(os.environ.get("AGENT_POST_TIMEOUT_SEC", "10"))
+
+# Quando detecta intrusão, agente para de enviar dados até que o servidor libere
+POLL_ACTION_INTERVAL_SEC = float(os.environ.get(
+    "AGENT_POLL_ACTION_INTERVAL_SEC", "10"))
+
+# caminhos possíveis para lista de processos suspeitos (será carregada se existir)
+SUSPICIOUS_LIST_PATHS = [
+    os.path.join(_script_dir(), "list.txt"),
+    os.path.join(_script_dir(), "modulos", "Agent", "list.txt"),
+    os.path.join(_script_dir(), "public", "modulos", "Agent", "list.txt"),
+]
 
 
 def get_port() -> str:
@@ -72,8 +87,10 @@ def is_apipa(ip: str) -> bool:
 
 def get_default_gateway_ipv4() -> Optional[str]:
     try:
-        out = subprocess.check_output(["ipconfig"], text=True, encoding="cp850", errors="ignore")
-        m = re.findall(r"(?:Gateway padrão|Default Gateway)[^\d]*(\d+\.\d+\.\d+\.\d+)", out)
+        out = subprocess.check_output(
+            ["ipconfig"], text=True, encoding="cp850", errors="ignore")
+        m = re.findall(
+            r"(?:Gateway padrão|Default Gateway)[^\d]*(\d+\.\d+\.\d+\.\d+)", out)
         if m:
             for gw in m:
                 if not is_apipa(gw):
@@ -176,7 +193,8 @@ def list_processes() -> List[Dict[str, Any]]:
     # ----------------------------
     if psutil is not None:
         try:
-            attrs = ["pid", "ppid", "name", "exe", "cmdline", "username", "create_time", "memory_info"]
+            attrs = ["pid", "ppid", "name", "exe", "cmdline",
+                     "username", "create_time", "memory_info"]
             for p in psutil.process_iter(attrs=attrs):
                 info = p.info or {}
                 name = (info.get("name") or "").strip()
@@ -222,7 +240,8 @@ def list_processes() -> List[Dict[str, Any]]:
     # Fallback Windows (tasklist)
     # ----------------------------
     try:
-        out = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], text=True, encoding="cp850", errors="ignore")
+        out = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"], text=True, encoding="cp850", errors="ignore")
         lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
         for ln in lines:
             parts = [p.strip().strip('"') for p in ln.split('","')]
@@ -237,7 +256,8 @@ def list_processes() -> List[Dict[str, Any]]:
 
             mem_mb = None
             if len(parts) >= 5:
-                mem_str = parts[4].replace(".", "").replace("K", "").replace("k", "").strip()
+                mem_str = parts[4].replace(".", "").replace(
+                    "K", "").replace("k", "").strip()
                 try:
                     mem_kb = int(mem_str)
                     mem_mb = mem_kb / 1024.0
@@ -311,6 +331,125 @@ def choose_post_url() -> str:
     return POST_URL
 
 
+def load_suspicious_patterns() -> List[str]:
+    """Tenta carregar uma lista local de padrões (uma por linha)."""
+    patterns: List[str] = []
+    for p in SUSPICIOUS_LIST_PATHS:
+        try:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if not ln or ln.startswith("#"):
+                            continue
+                        patterns.append(ln.lower())
+                if patterns:
+                    return patterns
+        except Exception:
+            continue
+
+    # fallback: tentar buscar no servidor público (mesmo host base que POST_URL)
+    try:
+        base = choose_post_url()
+        # transforma http://host:port/pc-check -> http://host:port/modulos/Agent/list.txt
+        parsed = urlparse(base)
+        root = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        url = root + "/modulos/Agent/list.txt"
+        if requests is not None:
+            r = requests.get(url, timeout=2)
+            if r.status_code == 200:
+                for ln in r.text.splitlines():
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    patterns.append(ln.lower())
+    except Exception:
+        pass
+
+    return patterns
+
+
+def _normalize_pattern(s: str) -> str:
+    s = (s or "").strip().lower()
+    if s.endswith('.exe'):
+        return s
+    return s
+
+
+def find_suspicious_in_processes(processes: List[Dict[str, Any]], patterns: List[str]) -> List[str]:
+    found: List[str] = []
+    if not patterns:
+        return found
+    pats = set(_normalize_pattern(p) for p in patterns if p)
+    for proc in processes:
+        name = (proc.get('name') or '').strip()
+        if not name:
+            continue
+        lname = name.lower()
+        base = (proc.get('base_name') or lname.replace('.exe', '')).lower()
+        for p in pats:
+            if not p:
+                continue
+            # match by exact base or exact name or substring
+            if base == p or lname == p or p in lname or lname in p:
+                if name not in found:
+                    found.append(name)
+    return found
+
+
+def perform_action(action: str, target: Optional[str]) -> bool:
+    """Executa ação no host. Retorna True se executado (não necessariamente com sucesso total)."""
+    try:
+        system = platform.system().lower()
+        if action == 'restart':
+            if system == 'windows':
+                subprocess.Popen(['shutdown', '/r', '/t', '5'])
+            else:
+                subprocess.Popen(['shutdown', '-r', 'now'])
+            return True
+        if action == 'shutdown':
+            if system == 'windows':
+                subprocess.Popen(['shutdown', '/s', '/t', '5'])
+            else:
+                subprocess.Popen(['shutdown', '-h', 'now'])
+            return True
+        if action == 'remove_and_restart' or action == 'kill_remove_restart':
+            # attempt to kill processes by name (target) and remove file if path provided
+            if target:
+                t = target.strip()
+                # kill processes matching target name
+                if psutil:
+                    for p in psutil.process_iter(['name', 'exe']):
+                        try:
+                            nm = (p.info.get('name') or '').lower()
+                            exe = (p.info.get('exe') or '').lower()
+                            if t.lower() in nm or t.lower() in exe:
+                                try:
+                                    p.kill()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                else:
+                    # best-effort using taskkill on Windows
+                    if system == 'windows':
+                        try:
+                            subprocess.call(['taskkill', '/IM', t, '/F'])
+                        except Exception:
+                            pass
+                # try remove file if path exists
+                try:
+                    if os.path.exists(t):
+                        os.remove(t)
+                except Exception:
+                    pass
+            # then restart
+            return perform_action('restart', None)
+    except Exception:
+        return False
+    return False
+
+
 def post_payload(port: str, payload: dict) -> bool:
     if requests is None:
         print("requests não está instalado. Instale com: pip install requests")
@@ -342,10 +481,69 @@ if __name__ == "__main__":
     ip = get_local_ipv4()
     os_name = get_os_name()
 
+    # carregar padrões locais de processos suspeitos (se houver)
+    suspicious_patterns = load_suspicious_patterns()
+    if suspicious_patterns:
+        print(f"Loaded {len(suspicious_patterns)} suspicious patterns")
+
+    blocked = False
+
     while True:
         uptime = get_uptime_text()
         processes = list_processes()
 
+        # detectar processos intrusos localmente se tivermos padrões
+        intrusion_procs = find_suspicious_in_processes(
+            processes, suspicious_patterns)
+        if intrusion_procs and not blocked:
+            # enviar alerta único e entrar em modo bloqueado
+            alert_payload = {
+                "hostname": hostname,
+                "status": "ALERT",
+                "ip": ip,
+                "os": os_name,
+                "uptime": uptime,
+                "processes": processes,
+                "process_count": len(processes),
+                "collected_at": int(time.time()),
+                "intrusion": True,
+                "intrusion_processes": intrusion_procs,
+                "blocked": True,
+            }
+            ok = post_payload(port, alert_payload)
+            print(("ALERT SENT" if ok else "ALERT ERRO"),
+                  "-", hostname, intrusion_procs)
+            blocked = True
+
+        if blocked:
+            # não enviamos mais dados, apenas consultamos o servidor de ações
+            try:
+                chosen = choose_post_url()
+                parsed = urlparse(chosen)
+                root = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+                action_url = f"{root}/pc-action?port={port}&hostname={hostname}"
+                if requests:
+                    r = requests.get(action_url, timeout=POST_TIMEOUT_SEC)
+                    if r.status_code == 200:
+                        try:
+                            j = r.json()
+                            if isinstance(j, dict) and j.get('ok') and j.get('allow'):
+                                action = j.get('action')
+                                target = j.get('target')
+                                print('Action allowed by server:',
+                                      action, target)
+                                if action:
+                                    perform_action(action, target)
+                                blocked = False
+                                # after performing action, continue loop (will send normal payload next)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            time.sleep(POLL_ACTION_INTERVAL_SEC)
+            continue
+
+        # normal payload (quando não bloqueado)
         payload = {
             "hostname": hostname,
             "status": "Online",
@@ -358,5 +556,6 @@ if __name__ == "__main__":
         }
 
         ok = post_payload(port, payload)
-        print(("OK" if ok else "ERRO"), "-", hostname, ip, uptime, f"procs={len(processes)}")
+        print(("OK" if ok else "ERRO"), "-", hostname,
+              ip, uptime, f"procs={len(processes)}")
         time.sleep(SEND_INTERVAL_SEC)
