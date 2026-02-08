@@ -9,6 +9,8 @@ import sys
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 
+print("TEST VERSION")
+
 
 def _script_dir() -> str:
     # 1) PyInstaller (rodando como .exe)
