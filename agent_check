@@ -71,6 +71,92 @@ SUSPICIOUS_LIST_PATHS = [
     os.path.join(_script_dir(), "public", "modulos", "Agent", "list.txt"),
 ]
 
+# Lista embutida padrão (fallback quando não houver arquivo externo)
+SUSPICIOUS_PATTERNS_DEFAULT = [
+    # GENÉRICOS
+    "main", "main.exe",
+    "service", "service.exe",
+    "client", "client.exe",
+    "server", "server.exe",
+    "update", "update.exe",
+    "updater", "updater.exe",
+    "install", "install.exe",
+    "setup", "setup.exe",
+    "patch", "patch.exe",
+    "loader", "loader.exe",
+    "run", "run.exe",
+    "task", "task.exe",
+    "system", "system.exe",
+    "app", "app.exe",
+    "agent", "agent.exe",
+    "helper", "helper.exe",
+    "worker", "worker.exe",
+    "host", "host.exe",
+    "runtime", "runtime.exe",
+    # PARECE WINDOWS
+    "svchosts", "svchosts.exe",
+    "explore", "explore.exe",
+    "winlogin", "winlogin.exe",
+    "lsasss", "lsasss.exe",
+    "csrsss", "csrsss.exe",
+    "taskmngr", "taskmngr.exe",
+    "spoolsvc", "spoolsvc.exe",
+    "serviceshost", "serviceshost.exe",
+    "system32", "system32.exe",
+    "chromeupdate", "chromeupdate.exe",
+    # LOLBINS
+    "pwsh", "pwsh.exe",
+    "wscript", "wscript.exe",
+    "cscript", "cscript.exe",
+    "mshta", "mshta.exe",
+    "rundll32", "rundll32.exe",
+    "regsvr32", "regsvr32.exe",
+    "schtasks", "schtasks.exe",
+    "wmic", "wmic.exe",
+    "bitsadmin", "bitsadmin.exe",
+    "certutil", "certutil.exe",
+    "net", "net.exe",
+    "netsh", "netsh.exe",
+    "sc", "sc.exe",
+    # CONTROLE REMOTO
+    "anydesk", "anydesk.exe",
+    "teamviewer", "teamviewer.exe",
+    "screenconnect", "screenconnect.exe",
+    "splashtop", "splashtop.exe",
+    "vnc", "vnc.exe",
+    "tightvnc", "tightvnc.exe",
+    "ultravnc", "ultravnc.exe",
+    # FERRAMENTAS OFENSIVAS
+    "mimikatz", "mimikatz.exe",
+    "psexec", "psexec.exe",
+    "procdump", "procdump.exe",
+    "beacon", "beacon.exe",
+    "cobaltstrike", "cobaltstrike.exe",
+    "meterpreter", "meterpreter.exe",
+    "empire", "empire.exe",
+    "bloodhound", "bloodhound.exe",
+    "netcat", "netcat.exe",
+    "nc", "nc.exe",
+    # KEYLOGGER / SPYWARE
+    "keylogger", "keylogger.exe",
+    "hook", "hook.exe",
+    "capture", "capture.exe",
+    "screen", "screen.exe",
+    "spy", "spy.exe",
+    "stealer", "stealer.exe",
+    "grabber", "grabber.exe",
+    "logger", "logger.exe",
+    "monitor", "monitor.exe",
+    "record", "record.exe",
+    # MINERADORES
+    "xmrig", "xmrig.exe",
+    "miner", "miner.exe",
+    "minerd", "minerd.exe",
+    "cryptonight", "cryptonight.exe",
+    "cpuhelper", "cpuhelper.exe",
+    "gpuworker", "gpuworker.exe",
+]
+
 
 def get_port() -> str:
     cfg_path = os.path.join(_script_dir(), "agent_check_port.txt")
@@ -368,7 +454,11 @@ def load_suspicious_patterns() -> List[str]:
     except Exception:
         pass
 
-    return patterns
+    if patterns:
+        return patterns
+
+    # fallback to embedded default patterns
+    return list(SUSPICIOUS_PATTERNS_DEFAULT)
 
 
 def _normalize_pattern(s: str) -> str:
