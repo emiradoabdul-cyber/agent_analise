@@ -9,7 +9,7 @@ import sys
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 
-print("TEST VERSION FINAL")
+print("FIMAL VERSION 1.0")
 
 
 def _script_dir() -> str:
