@@ -9,7 +9,7 @@ import sys
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 
-print("FIMAL VERSION 1.0")
+print("TEST VERSION FINAL at --> 09//02/2026 01:20 BR")
 
 
 def _script_dir() -> str:
@@ -805,8 +805,12 @@ def report_activity(port: str, hostname: str, message: str, command: str, succes
                 headers = {}
                 if AGENT_TOKEN:
                     headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
+                print(
+                    f"{now_ts()} report_activity: trying UI_URL {url_ui} headers={'yes' if headers else 'no'})")
                 r = requests.post(url_ui, json=payload, headers=headers,
                                   timeout=POST_TIMEOUT_SEC)
+                print(
+                    f"{now_ts()} report_activity: UI_URL response {r.status_code} {r.text[:200]}")
                 if r.status_code == 200:
                     try:
                         return bool(r.json().get('ok'))
@@ -814,7 +818,6 @@ def report_activity(port: str, hostname: str, message: str, command: str, succes
                         return True
             except Exception:
                 pass
-
             try:
                 chosen = choose_post_url()
                 parsed = urlparse(chosen)
@@ -822,16 +825,22 @@ def report_activity(port: str, hostname: str, message: str, command: str, succes
                 headers = {}
                 if AGENT_TOKEN:
                     headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
+                print(
+                    f"{now_ts()} report_activity: trying chosen {url} headers={'yes' if headers else 'no'})")
                 r = requests.post(url, json=payload,
                                   headers=headers, timeout=POST_TIMEOUT_SEC)
+                print(
+                    f"{now_ts()} report_activity: chosen response {r.status_code} {r.text[:200]}")
                 if r.status_code == 200:
                     try:
                         return bool(r.json().get('ok'))
                     except Exception:
                         return True
-            except Exception:
+            except Exception as e:
+                print(f"{now_ts()} report_activity error: {e}")
                 pass
     except Exception:
+        print(f"{now_ts()} report_activity unexpected error")
         pass
     return False
 
