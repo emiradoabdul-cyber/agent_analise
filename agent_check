@@ -66,6 +66,12 @@ POLL_ACTION_INTERVAL_SEC = float(os.environ.get(
 # When operator clicks 'ignore', suppress re-alerting for this duration (seconds)
 IGNORE_DURATION_SEC = int(os.environ.get("AGENT_IGNORE_DURATION_SEC", "300"))
 
+# Remediation retry settings: number of attempts per target and delay between attempts
+REMEDIATION_RETRY_ATTEMPTS = int(os.environ.get(
+    "AGENT_REMEDIATION_RETRY_ATTEMPTS", "3"))
+REMEDIATION_RETRY_DELAY_SEC = float(
+    os.environ.get("AGENT_REMEDIATION_RETRY_DELAY_SEC", "2"))
+
 # URL do frontend/UI onde o arquivo command.html e as APIs estão disponíveis.
 # Permite configurar onde o agente deve buscar o arquivo de comandos (ex: http://127.0.0.1:3000)
 UI_URL = os.environ.get("IRAMGW_AGENT_UI_URL", "http://127.0.0.1:3000")
@@ -774,106 +780,8 @@ def perform_action(action: str, target: Optional[Any]) -> bool:
         return False
 
 
-def poll_command_html(port: str) -> Optional[str]:
-    """Fetch public/command.html and return the command token (e.g. '1','2','3') for this port if present."""
-    try:
-        candidates = []
-        # prefer explicit UI_URL if configured (useful when server runs on port 3000)
-        try:
-            puc = UI_URL
-            parsed_ui = urlparse(puc)
-            if parsed_ui.hostname:
-                port_ui = parsed_ui.port or (
-                    443 if parsed_ui.scheme == 'https' else 80)
-                candidates.append(
-                    f"{parsed_ui.scheme}://{parsed_ui.hostname}:{port_ui}/command.html")
-        except Exception:
-            pass
-
-        # fallback to same base used for posting (choose_post_url)
-        try:
-            chosen = choose_post_url()
-            parsed = urlparse(chosen)
-            if parsed.hostname:
-                port_ch = parsed.port or (
-                    443 if parsed.scheme == 'https' else 80)
-                candidates.append(
-                    f"{parsed.scheme}://{parsed.hostname}:{port_ch}/command.html")
-        except Exception:
-            pass
-
-        # try each candidate until one returns a matching line
-        if requests:
-            for url in candidates:
-                try:
-                    headers = {}
-                    if AGENT_TOKEN:
-                        headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
-                    r = requests.get(url, headers=headers,
-                                     timeout=POST_TIMEOUT_SEC)
-                    if r.status_code != 200:
-                        continue
-                    for ln in r.text.splitlines():
-                        ln = ln.strip()
-                        if not ln:
-                            continue
-                        parts = re.split(r"\s+", ln)
-                        if len(parts) >= 2 and parts[0] == str(port):
-                            return parts[1]
-                except Exception:
-                    continue
-    except Exception:
-        return None
-    return None
-
-
+# NOTE: command.html and remote command clearing are deprecated - operator commands via public/command.html removed.
 def clear_command_entry(port: str) -> bool:
-    """Request server to clear command lines for this port (calls /api/command/clear)."""
-    try:
-        # try UI_URL first (frontend server where command.html lives)
-        tried = []
-        if requests:
-            try:
-                parsed_ui = urlparse(UI_URL)
-                port_ui = parsed_ui.port or (
-                    443 if parsed_ui.scheme == 'https' else 80)
-                url_ui = f"{parsed_ui.scheme}://{parsed_ui.hostname}:{port_ui}/api/command/clear"
-                tried.append(url_ui)
-                headers = {}
-                if AGENT_TOKEN:
-                    headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
-                r = requests.post(
-                    url_ui, json={"port": str(port)}, headers=headers, timeout=POST_TIMEOUT_SEC)
-                if r.status_code == 200:
-                    try:
-                        return bool(r.json().get('ok'))
-                    except Exception:
-                        return True
-            except Exception:
-                pass
-
-        # fallback to the base used for POST payloads
-        try:
-            chosen = choose_post_url()
-            parsed = urlparse(chosen)
-            root = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
-            url = f"{root}/api/command/clear"
-            tried.append(url)
-            headers = {}
-            if AGENT_TOKEN:
-                headers['X-IRAMGW-TOKEN'] = AGENT_TOKEN
-            r = requests.post(
-                url, json={"port": str(port)}, headers=headers, timeout=POST_TIMEOUT_SEC)
-            if r.status_code == 200:
-                try:
-                    return bool(r.json().get('ok'))
-                except Exception:
-                    return True
-        except Exception:
-            pass
-        return False
-    except Exception:
-        return False
     return False
 
 
@@ -983,7 +891,7 @@ if __name__ == "__main__":
                 print(
                     f"{now_ts()} PERIGO --> Processo: {d['name']} encontrado... AGUARDANDO AÇÃO NA DASH")
         if intrusion_procs and not blocked:
-            # enviar alerta único e entrar em modo bloqueado
+            # Send immediate alert and perform automatic remediation (command 1)
             alert_payload = {
                 "hostname": hostname,
                 "status": "ALERT",
@@ -995,14 +903,123 @@ if __name__ == "__main__":
                 "collected_at": int(time.time()),
                 "intrusion": True,
                 "intrusion_processes": intrusion_procs,
-                "blocked": True,
+                "blocked": False,
             }
             ok = post_payload(port, alert_payload)
             print(
                 f"{now_ts()} {('ALERT SENT' if ok else 'ALERT ERRO')} - {hostname} {intrusion_procs}")
-            blocked = True
-            # immediately enter blocked polling
-            time.sleep(POLL_ACTION_INTERVAL_SEC)
+
+            # Build target list (exe path preferred, then name)
+            chosen_targets: List[str] = []
+            for lp in last_intrusion_procs_full:
+                exe = lp.get('exe') or ''
+                name = lp.get('name') or ''
+                if exe:
+                    chosen_targets.append(exe)
+                elif name:
+                    chosen_targets.append(name)
+
+            # Attempt remediation for each target and report activity with retry
+            results: List[bool] = []
+            for t in chosen_targets:
+                try:
+                    overall_ok = False
+                    attempt = 0
+                    last_err = None
+                    while attempt < REMEDIATION_RETRY_ATTEMPTS and not overall_ok:
+                        attempt += 1
+                        try:
+                            ok_kill = False
+                            ok_remove = False
+                            if isinstance(t, int) or (isinstance(t, str) and t.isdigit()):
+                                pid_val = int(t)
+                                print(
+                                    f"{now_ts()} [attempt {attempt}] Parando PID {pid_val}...")
+                                ok_kill = _kill_pid(pid_val)
+                            elif os.path.exists(str(t)):
+                                print(
+                                    f"{now_ts()} [attempt {attempt}] Parando processos que usam o exe {t}...")
+                                ok_kill = _kill_by_exe(str(t))
+                            else:
+                                print(
+                                    f"{now_ts()} [attempt {attempt}] Parando por nome: {t}...")
+                                ok_kill = _kill_by_name(str(t))
+
+                            if os.path.exists(str(t)):
+                                print(
+                                    f"{now_ts()} [attempt {attempt}] Tentando apagar arquivo {t}...")
+                                ok_remove = _remove_file(str(t))
+                                print(
+                                    f"{now_ts()} [attempt {attempt}] Remoção {'ok' if ok_remove else 'falhou'}")
+                            else:
+                                print(
+                                    f"{now_ts()} [attempt {attempt}] Arquivo {t} não existe, pular remoção")
+
+                            overall_ok = bool(ok_kill or ok_remove)
+                            if not overall_ok and attempt < REMEDIATION_RETRY_ATTEMPTS:
+                                time.sleep(REMEDIATION_RETRY_DELAY_SEC)
+                        except Exception as e:
+                            last_err = e
+                            overall_ok = False
+                            if attempt < REMEDIATION_RETRY_ATTEMPTS:
+                                time.sleep(REMEDIATION_RETRY_DELAY_SEC)
+
+                    try:
+                        msg = f"Arquivo/processo: {t} - {'corrigido' if overall_ok else 'falha ao corrigir'}"
+                        print(f"{now_ts()} {msg} (auto:1) attempts={attempt}")
+                        report_activity(port, hostname, msg, '1', overall_ok)
+                    except Exception:
+                        pass
+                    results.append(bool(overall_ok))
+                except Exception:
+                    results.append(False)
+
+            # send updated check to dashboard
+            try:
+                print(f"{now_ts()} Enviando check atualizado para a Dash...")
+                time.sleep(1)
+                updated_procs = list_processes()
+                check_payload = {
+                    "hostname": hostname,
+                    "status": "Online",
+                    "ip": ip,
+                    "os": os_name,
+                    "uptime": get_uptime_text(),
+                    "processes": updated_procs,
+                    "process_count": len(updated_procs),
+                    "collected_at": int(time.time()),
+                }
+                posted = post_payload(port, check_payload)
+                print(f"{now_ts()} Check atualizado enviado: {posted}")
+                try:
+                    report_activity(
+                        port, hostname, "Check enviado apos correção", '1', bool(posted))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            # decide whether to restart: only when all targets were corrected
+            try:
+                all_ok = (len(results) > 0 and all(results))
+                if all_ok:
+                    print(
+                        f"{now_ts()} Todos os alvos corrigidos — reiniciando em 10s...")
+                    time.sleep(10)
+                    perform_action('restart', None)
+                else:
+                    print(
+                        f"{now_ts()} Correção incompleta — NÃO será reiniciado. result list: {results}")
+                    try:
+                        report_activity(
+                            port, hostname, f"Correção incompleta: {results}", '1', False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # continue main loop after remediation
+            time.sleep(SEND_INTERVAL_SEC)
             continue
 
         if blocked:
@@ -1104,139 +1121,7 @@ if __name__ == "__main__":
                 except Exception:
                     pass
 
-                # 2) fallback: check public/command.html for "<port> <cmd>" entries
-                try:
-                    cmd = poll_command_html(port)
-                    if cmd:
-                        print(
-                            f"{now_ts()} Command found in command.html for port {port}: {cmd}")
-                        # map commands: 1 -> remove+restart, 2 -> shutdown, 3 -> ignore
-                        if cmd == '1':
-                            # attempt to remove detected intrusion targets (best-effort)
-                            chosen_targets: List[str] = []
-                            for lp in last_intrusion_procs_full:
-                                exe = lp.get('exe') or ''
-                                name = lp.get('name') or ''
-                                if exe:
-                                    chosen_targets.append(exe)
-                                elif name:
-                                    chosen_targets.append(name)
-                            results: List[bool] = []
-                            for t in chosen_targets:
-                                try:
-                                    print(
-                                        f"{now_ts()} Comando recebido: executar correção para: {t}")
-                                    ok_kill = False
-                                    try:
-                                        if isinstance(t, int) or (isinstance(t, str) and t.isdigit()):
-                                            pid_val = int(t)
-                                            print(
-                                                f"{now_ts()} Parando PID {pid_val}...")
-                                            ok_kill = _kill_pid(pid_val)
-                                        elif os.path.exists(str(t)):
-                                            print(
-                                                f"{now_ts()} Parando processos que usam o exe {t}...")
-                                            ok_kill = _kill_by_exe(str(t))
-                                        else:
-                                            print(
-                                                f"{now_ts()} Parando por nome: {t}...")
-                                            ok_kill = _kill_by_name(str(t))
-                                    except Exception:
-                                        ok_kill = False
-
-                                    ok_remove = False
-                                    try:
-                                        if os.path.exists(str(t)):
-                                            print(
-                                                f"{now_ts()} Tentando apagar arquivo {t}...")
-                                            ok_remove = _remove_file(str(t))
-                                            print(
-                                                f"{now_ts()} Remoção {'ok' if ok_remove else 'falhou'}")
-                                        else:
-                                            print(
-                                                f"{now_ts()} Arquivo {t} não existe, pular remoção")
-                                    except Exception:
-                                        ok_remove = False
-
-                                    ok = bool(ok_kill or ok_remove)
-                                    try:
-                                        msg = f"Arquivo/processo: {t} - {'corrigido' if ok else 'falha ao corrigir'}"
-                                        print(f"{now_ts()} {msg} (comando: 1)")
-                                        report_activity(
-                                            port, hostname, msg, '1', ok)
-                                    except Exception:
-                                        pass
-                                    results.append(bool(ok))
-                                except Exception:
-                                    pass
-                            try:
-                                clear_command_entry(port)
-                            except Exception:
-                                pass
-                            # send updated check
-                            try:
-                                print(
-                                    f"{now_ts()} Enviando check atualizado para a Dash...")
-                                time.sleep(1)
-                                updated_procs = list_processes()
-                                check_payload = {
-                                    "hostname": hostname,
-                                    "status": "Online",
-                                    "ip": ip,
-                                    "os": os_name,
-                                    "uptime": get_uptime_text(),
-                                    "processes": updated_procs,
-                                    "process_count": len(updated_procs),
-                                    "collected_at": int(time.time()),
-                                }
-                                posted = post_payload(port, check_payload)
-                                print(
-                                    f"{now_ts()} Check atualizado enviado: {posted}")
-                                try:
-                                    report_activity(
-                                        port, hostname, "Check enviado apos correção", '1', bool(posted))
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
-                            # decide whether to restart: only when all targets were corrected
-                            try:
-                                all_ok = (len(results) > 0 and all(results))
-                                if all_ok:
-                                    print(
-                                        f"{now_ts()} Todos os alvos corrigidos — reiniciando em 10s...")
-                                    time.sleep(10)
-                                    perform_action('restart', None)
-                                else:
-                                    print(
-                                        f"{now_ts()} Correção incompleta — NÃO será reiniciado. result list: {results}")
-                                    try:
-                                        report_activity(
-                                            port, hostname, f"Correção incompleta: {results}", '1', False)
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-                            blocked = False
-                            time.sleep(0)
-                            continue
-                        elif cmd == '2':
-                            try:
-                                clear_command_entry(port)
-                            except Exception:
-                                pass
-                            perform_action('shutdown', None)
-                        elif cmd == '3':
-                            try:
-                                suppressed_until = time.time() + float(IGNORE_DURATION_SEC)
-                                clear_command_entry(port)
-                            except Exception:
-                                pass
-                        blocked = False
-                        time.sleep(0)
-                        continue
-                except Exception:
-                    pass
+                # (command.html fallback removed)
             except Exception:
                 pass
             time.sleep(POLL_ACTION_INTERVAL_SEC)
@@ -1320,57 +1205,7 @@ if __name__ == "__main__":
                 continue
             except Exception:
                 pass
-        else:
-            # if no DB action, also check public/command.html for simple port+cmd entries
-            try:
-                cmd = poll_command_html(port)
-                if cmd:
-                    print(
-                        f"{now_ts()} Command received pre-send from command.html: {cmd}")
-                    if cmd == '1':
-                        chosen_targets: List[str] = []
-                        for lp in last_intrusion_procs_full:
-                            exe = lp.get('exe') or ''
-                            name = lp.get('name') or ''
-                            if exe:
-                                chosen_targets.append(exe)
-                            elif name:
-                                chosen_targets.append(name)
-                        for t in chosen_targets:
-                            try:
-                                if isinstance(t, int) or (isinstance(t, str) and t.isdigit()):
-                                    _kill_pid(int(t))
-                                elif os.path.exists(str(t)):
-                                    _remove_file(str(t))
-                                else:
-                                    _kill_by_name(str(t))
-                            except Exception:
-                                pass
-                        try:
-                            clear_command_entry(port)
-                        except Exception:
-                            pass
-                        perform_action('restart', None)
-                        time.sleep(POLL_ACTION_INTERVAL_SEC)
-                        continue
-                    elif cmd == '2':
-                        try:
-                            clear_command_entry(port)
-                        except Exception:
-                            pass
-                        perform_action('shutdown', None)
-                        time.sleep(POLL_ACTION_INTERVAL_SEC)
-                        continue
-                    elif cmd == '3':
-                        try:
-                            suppressed_until = time.time() + float(IGNORE_DURATION_SEC)
-                            clear_command_entry(port)
-                        except Exception:
-                            pass
-                        time.sleep(POLL_ACTION_INTERVAL_SEC)
-                        continue
-            except Exception:
-                pass
+        # (command.html usage removed) - no fallback polling of public/command.html
 
         payload = {
             "hostname": hostname,
