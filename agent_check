@@ -9,7 +9,7 @@ import sys
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 
-print("TEST VERSION 5")
+print("TEST VERSION FINAL")
 
 
 def _script_dir() -> str:
@@ -889,7 +889,7 @@ if __name__ == "__main__":
         if intrusion_details:
             for d in intrusion_details:
                 print(
-                    f"{now_ts()} PERIGO --> Processo: {d['name']} encontrado... AGUARDANDO AÇÃO NA DASH")
+                    f"{now_ts()} PERIGO --> Processo: {d['name']} encontrado... iniciando correção automática")
         if intrusion_procs and not blocked:
             # Send immediate alert and perform automatic remediation (command 1)
             alert_payload = {
